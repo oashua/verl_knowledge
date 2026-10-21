@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>性能调优 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 吞吐优化手册：rollout 生成调优、序列打包与 remove padding、动态 batch、LigerKernel、FSDP 通信优化、batch size 归一化原则、off-policy 与吞吐的权衡。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>性能调优</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 核心篇</div>
+  <h1>性能调优</h1>
+  <div class="meta">
+    基于 verl 官方文档 <code>docs/perf/perf_tuning.rst</code>、<code>docs/perf/best_practices.rst</code> 与源码整理（2025-10 main 分支）。
+    原则：显存先保住（见显存篇），再逐项换吞吐。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#measure">先测量：找到时间都花在哪</a></li>
+    <li><a href="#rollout">Rollout 吞吐调优（通常是最大头）</a></li>
+    <li><a href="#packing">序列打包与 remove padding</a></li>
+    <li><a href="#batch">Batch size：全局与本地、固定与动态</a></li>
+    <li><a href="#kernels">Kernel 级优化：compile、Liger、融合 kernel</a></li>
+    <li><a href="#comm">FSDP 通信优化</a></li>
+    <li><a href="#async">异步训练：colocate / separate async</a></li>
+    <li><a href="#offpolicy">吞吐 × off-policy 的权衡</a></li>
+    <li><a href="#checklist">调优 checklist</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="measure">
+  <h2>1. 先测量：找到时间都花在哪</h2>
+  <p>
+    RL 一个 step = 生成 + 旧策略 log-prob + ref log-prob + critic/RM 前向 + actor/critic 更新（+ 验证）。
+    调优前先看 wandb/console 里的 step 时间分解（<code>timing/gen</code>、<code>timing/actor_update</code> 等），
+    判断瓶颈在<strong>推理侧</strong>还是<strong>训练侧</strong>——两者对策完全不同：
+  </p>
+  <ul class="plain">
+    <li>生成占比高（长思维链任务几乎总是如此）→ 先做 <a href="#rollout">rollout 调优</a>或异步化</li>
+    <li>更新占比高 → <a href="#batch">动态 batch</a> + <a href="#kernels">kernel 优化</a></li>
+    <li>长尾等待/负载不均 → <code>trainer.balance_batch=True</code>（默认开）按 token 数均衡各 DP rank 的批次</li>
+  </ul>
+  <p>深入分析工具：</p>
+  <table>
+    <thead><tr><th>工具</th><th>配置</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>torch profiler</td><td><code>global_profiler.tool=torch</code> + <code>steps=[s,e]</code></td><td>kernel 级火焰图，定位慢 kernel</td></tr>
+      <tr><td>nsys</td><td><code>global_profiler.tool=nsys</code></td><td>NCCL 通信与计算重叠分析</td></tr>
+      <tr><td>torch_memory</td><td><code>global_profiler.tool=torch_memory</code></td><td>显存分配快照 / OOM 现场</td></tr>
+      <tr><td>Ray timeline</td><td><code>ray_kwargs.timeline_json_file=...</code></td><td>driver 调度与 worker 空闲分析</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="rollout">
+  <h2>2. Rollout 吞吐调优（通常是最大头）</h2>
+  <p>官方 perf_tuning 的推荐动作，按性价比排序：</p>
+  <ol class="plain">
+    <li>
+      <strong>打开 rollout 统计</strong>：<code>rollout.disable_log_stats=False</code>，
+      观察 GPU cache utilization（KV cache 命中率）与 running/pending 请求数，一切调优以数据为准
+    </li>
+    <li>
+      <strong>提高 <code>gpu_memory_utilization</code></strong>：KV cache 变大 → 并发更高。
+      训练侧 offload 全开后可到 0.8–0.9；注意 vLLM（占总显存比例）与 SGLang（占空闲显存中静态部分比例）语义不同
+    </li>
+    <li>
+      <strong>加大并发窗口</strong>：cache 利用率低时调大 <code>max_num_seqs</code>（默认 256）或
+      <code>max_num_batched_tokens</code>（官方建议 &gt; 2048，经验值
+      <code>max(8192, max_prompt_length + max_response_length, max_model_len)</code>）；
+      <code>enable_chunked_prefill=True</code>（默认开）配合使用
+    </li>
+    <li>
+      <strong>TP 尽量小</strong>：同样卡数下多个小 TP replica（高 DP）吞吐优于大 TP——TP 内每层有 all-reduce，
+      DP 只在数据层面切分；代价是 KV cache 总量变大。TP&gt;8 后收益急剧变差
+    </li>
+    <li>
+      <strong>prefix caching</strong>：<code>enable_prefix_caching=True</code>（默认开）对多轮工具调用 /
+      GRPO 同 prompt 采样 n 次的场景收益显著
+    </li>
+    <li>
+      <strong>采样参数</strong>：<code>temperature=1.0 / top_p=1.0 / top_k=-1</code> 保持足够随机性，
+      也避免了某些引擎的额外分支开销
+    </li>
+  </ol>
+  <div class="tip">
+    <b>进阶：</b>① PD 分离（SGLang）：<code>rollout.disaggregation.enabled=True</code>，
+    prefill/decode 独立 replica + nixl/mooncake KV 传输；② 过采样提前终止：
+    <code>rollout.over_sample_rate</code> 让全组提前收工（DAPO 式组内已够好即停）；③ MoE 推理
+    <code>expert_parallel_size</code>——注意 TP=32 时开 EP 反而可能拖慢 DeepSeek-V3 rollout，务必实测。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="packing">
+  <h2>3. 序列打包与 remove padding</h2>
+  <p>
+    RL 样本长度方差极大（回答从几十到上万 token），按最长序列 padding 会浪费大量算力。
+    <code>use_remove_padding=True</code> 启用 THD 打包路径（去 padding、变长拼接），是几乎所有场景的第一优先级开关：
+  </p>
+  <pre><code>actor_rollout_ref.model.use_remove_padding=True    # actor + rollout log-prob
+critic.model.use_remove_padding=True              # critic（如有）</code></pre>
+  <ul class="plain">
+    <li>Megatron 后端默认已开（<code>...megatron.use_remove_padding=True</code>）；FSDP 需显式设置</li>
+    <li>收益与批次内 padding 占比成正比——长尾长度分布下尤其明显</li>
+    <li>配套：<code>fsdp_config.pad_to_length=True</code> + <code>pad_to_length_bucket</code>（如 1024），
+      把打包后的 token 数对齐到少数几个档位，避免每个 micro batch 形状都不同导致 kernel 反复重编译；
+      设为 <code>max_token_len_per_gpu × SP</code> 可让所有 batch 归一到单一形状</li>
+    <li>新模型接入建议先跑 <code>pytest -s tests/models/test_transformer.py</code> 验证 padded/unpadded 前向一致</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="batch">
+  <h2>4. Batch size：全局与本地、固定与动态</h2>
+  <p>verl 的核心原则（写进官方文档的归一化规则）：</p>
+  <table>
+    <thead><tr><th>类型</th><th>参数</th><th>视角</th></tr></thead>
+    <tbody>
+      <tr><td>算法语义</td><td><code>data.train_batch_size</code>、<code>actor.ppo_mini_batch_size</code>、<code>critic.ppo_mini_batch_size</code></td><td><strong>全局</strong>（单控制器视角），worker 内部自动除以 DP</td></tr>
+      <tr><td>性能参数</td><td><code>*micro_batch_size_per_gpu</code>、<code>*max_token_len_per_gpu</code></td><td><strong>每卡本地</strong>，直接决定每卡显存与算力批次</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>注意：</b>脚本里请用 <code>*_per_gpu</code> 版本；旧的 <code>ppo_micro_batch_size</code>（全局）已标记废弃。</div>
+
+  <h3>4.1 固定 micro batch 的调法</h3>
+  <ol class="plain">
+    <li>先开 gradient checkpointing，micro batch 才有上调空间</li>
+    <li><code>ppo_micro_batch_size_per_gpu</code> 尽量加大，直至 ≤ 归一化后的 mini_batch_size（再大就浪费）</li>
+    <li>纯前向角色（ref/rollout 的 log-prob、critic/RM forward）可设为 actor 的 2 倍</li>
+    <li>critic / reward 的 micro batch 可大于 actor（actor 输出头 vocab 巨大是瓶颈）</li>
+  </ol>
+
+  <h3>4.2 动态 batch（推荐）</h3>
+  <p>
+    <code>use_dynamic_bsz=True</code> 后不再调 <code>*micro_batch_size_per_gpu</code>，
+    改调 token 预算 <code>*max_token_len_per_gpu</code>（详见显存篇 §4.2）。
+    它同时解决「显存峰值由最长序列决定」和「短序列 batch 算不满」两个问题，官方 8B 基线脚本默认全角色开启。
+  </p>
+  <p>
+    批次大小本身的语义：<code>train_batch_size</code> 个 prompt × <code>rollout.n</code> 个回答 = 一次迭代的样本数。
+    <code>gen_batch_size</code>（默认 = train_batch_size）控制每次从 dataloader 取多少 prompt，
+    分离异步模式下可以 &gt; train_batch_size 攒批。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="kernels">
+  <h2>5. Kernel 级优化：compile、Liger、融合 kernel</h2>
+  <table>
+    <thead><tr><th>手段</th><th>参数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>torch.compile</td>
+        <td><code>actor_rollout_ref.actor.use_torch_compile=True</code>（默认开）</td>
+        <td>FSDP 路径默认启用；配合 pad_to_length 统一形状效果最佳（减少重编译）</td>
+      </tr>
+      <tr>
+        <td>LigerKernel</td>
+        <td><code>actor_rollout_ref.model.use_liger=True</code></td>
+        <td>融合 RMSNorm/SwiGLU/RoPE（Triton），SFT 与 RL 均可用；安装 <code>liger-kernel==0.8.4</code></td>
+      </tr>
+      <tr>
+        <td>融合输出头</td>
+        <td><code>actor_rollout_ref.model.use_fused_kernels=True</code></td>
+        <td>log-prob 输出头 chunk 化融合计算（<code>FusedLinearForPPOFunction</code>），直接砍 logits 峰值；
+          Megatron 下可与 use_liger 联用选 Liger 的 TP 版输出头</td>
+      </tr>
+      <tr>
+        <td>QAT / 权重量化</td>
+        <td><code>actor.qat.*</code>、<code>rollout.quantization.*</code></td>
+        <td>实验性，对吞吐和权重同步成本都有影响，需按官方 recipe 使用</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="warn">
+    <b>Liger × DeepEP 限制：</b>Megatron 原生 Liger 输出头不能与跨节点 DeepEP V1（NVSHMEM RDMA）同进程共存，
+    需改用 alltoall / DeepEP V2 或关掉融合输出头。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="comm">
+  <h2>6. FSDP 通信优化</h2>
+  <ol class="plain">
+    <li><strong>Hybrid Shard</strong>：<code>fsdp_config.fsdp_size</code> = 单机 GPU 数，all-gather 限制在机内 NVLink 域，多机时显著提速（见并行篇 §3.1）</li>
+    <li><strong>前向预取</strong>：<code>fsdp_config.forward_prefetch=True</code>（FSDP1），通信与计算重叠；后向预取官方不支持</li>
+    <li><strong>梯度累积免同步</strong>：<code>use_no_sync_for_gradient_accumulation=True</code>（FSDP2 路径 <code>set_requires_gradient_sync(False)</code>），
+      每 mini-batch 梯度同步从 M 次降到 1 次，数值不变；代价是累积期保留未分片梯度、峰值显存升高——显存紧张时保持默认 false</li>
+    <li><strong>FSDP2</strong>：<code>strategy=fsdp2</code>，DTensor/按参数分片，+1.5% 吞吐（TorchTitan 基准）</li>
+    <li><strong>reshard_after_forward=false</strong>：前向后不重分片（SHARD_GRAD_OP），省一次 all-gather 换显存</li>
+  </ol>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="async">
+  <h2>7. 异步训练：colocate / separate async</h2>
+  <p>
+    同步（sync）模式下生成与更新串行，GPU 在两个阶段各有一半时间「半闲置」。
+    <code>trainer.v1.trainer_mode</code> 提供两条异步化路径：
+  </p>
+  <table>
+    <thead><tr><th>模式</th><th>机制</th><th>关键参数</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>colocate_async</code></td>
+        <td>同一批 GPU 上训练与推理交错执行，rollout 数据攒够即训</td>
+        <td><code>v1.colocate_async.num_warmup_batches</code>（起步预攒批数，支持小数）</td>
+      </tr>
+      <tr>
+        <td><code>separate_async</code></td>
+        <td>独立 rollout 池（<code>rollout.nnodes</code>/<code>n_gpus_per_node</code> &gt; 0），训练 GPU 全速更新</td>
+        <td><code>v1.separate_async.num_warmup_batches</code>、<code>parameter_sync_step</code>（每几步同步一次权重）、<code>hybrid_rollout.enable_switch</code>（训练 GPU 闲时借给 rollout）</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    异步 = off-policy 程度上升，需配合采样控制：<code>v1.sampler.max_off_policy_threshold</code>
+    （轨迹最多跨越多少个模型版本，默认 8；超出按 <code>max_off_policy_strategy</code> drop 或 wait），
+    设 null 则完全放开。one-step off-policy 变体见 <code>verl/experimental/one_step_off_policy/</code>。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="offpolicy">
+  <h2>8. 吞吐 × off-policy 的权衡</h2>
+  <p>几个「加大就更快但更 off-policy」的旋钮，按对稳定性的影响排序：</p>
+  <table>
+    <thead><tr><th>参数</th><th>加大后的效果</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><code>actor.ppo_epochs</code></td><td>同一批数据多次更新，rollout 次数减少</td><td>importance ratio 偏离 1，clip 生效更频繁（默认 1，GRPO 常用 1）</td></tr>
+      <tr><td><code>data.train_batch_size</code></td><td>单步样本多，rollout 开销摊薄</td><td>off-policy 漂移增大；mini/micro 批次联动调整</td></tr>
+      <tr><td><code>trainer.v1.separate_async.parameter_sync_step</code></td><td>权重同步频率降低</td><td>推理策略滞后于训练策略</td></tr>
+      <tr><td><code>v1.sampler.max_off_policy_threshold</code></td><td>更多陈旧轨迹可用</td><td>训练信号失真</td></tr>
+    </tbody>
+  </table>
+  <p>
+    经验：先在 sync 模式把单阶段吞吐调到最优，再考虑异步化；异步收益在「生成远慢于更新」的任务上最大。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="checklist">
+  <h2>9. 调优 checklist</h2>
+  <ol class="plain">
+    <li>☐ <code>disable_log_stats=False</code>，看 step 时间分解 + KV cache 利用率</li>
+    <li>☐ <code>use_remove_padding=True</code>（actor/critic/model）</li>
+    <li>☐ <code>use_dynamic_bsz=True</code> + token 预算调到显存上限（前向角色 2×）</li>
+    <li>☐ <code>use_torch_compile=True</code> + <code>pad_to_length=True</code> 统一形状</li>
+    <li>☐ rollout：<code>gpu_memory_utilization</code> 顶格（配合训练侧 offload）、TP 尽量小、并发窗口够大</li>
+    <li>☐ <code>use_liger=True</code> / <code>use_fused_kernels=True</code>（模型支持时）</li>
+    <li>☐ 多机 FSDP：试 Hybrid Shard（fsdp_size=单机卡数）+ forward_prefetch</li>
+    <li>☐ 显存富余再开 <code>use_no_sync_for_gradient_accumulation=True</code></li>
+    <li>☐ 生成占比仍 &gt; 70%：评估 colocate_async / separate_async</li>
+    <li>☐ 每改一项记录一次吞吐（tokens/s 或 step 时间），防止负优化</li>
+  </ol>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>docs/perf/perf_tuning.rst</code>、<code>docs/perf/best_practices.rst</code>、
+  <code>verl/trainer/config/ppo_trainer.yaml</code>、官方基线脚本 <code>examples/ppo_trainer/run_qwen3_8b_fsdp.sh</code> ·
+  相关：<a href="parallelism.html">并行策略</a> / <a href="memory.html">显存与 OOM</a> · 下一篇：<a href="params-rollout.html">Rollout 参数</a>
+</footer>
+
+</div>
+</body>
+</html>
