@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>并行策略详解 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 并行参数手册：TP/PP/DP/CP/EP/ETP 含义、FSDP 与 Megatron 后端差异、rollout 推理并行、并行度与模型规模/序列长度的匹配公式。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>并行策略详解</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 核心篇</div>
+  <h1>并行策略详解</h1>
+  <div class="meta">
+    基于 verl 官方文档 <code>docs/perf/best_practices.rst</code> 与源码 <code>verl/trainer/config/</code> 整理（2025-10 main 分支）。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#overview">总览：GPU 预算与角色划分</a></li>
+    <li><a href="#engine">训练后端选择：FSDP 还是 Megatron</a></li>
+    <li><a href="#fsdp">FSDP 后端：fsdp_size 与 Ulysses 序列并行</a></li>
+    <li><a href="#megatron">Megatron 后端：TP / PP / CP / EP / ETP</a></li>
+    <li><a href="#rollout">Rollout 推理并行：vLLM / SGLang</a></li>
+    <li><a href="#align">各角色并行度对齐关系</a></li>
+    <li><a href="#match">并行度 × 模型规模 × 序列长度的匹配</a></li>
+    <li><a href="#params">并行参数速查表</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="overview">
+  <h2>1. 总览：GPU 预算与角色划分</h2>
+  <p>
+    verl 基于 HybridFlow 架构：一个<strong>单控制器</strong>（Ray driver）调度多个 worker group，
+    每个 group 承担一个角色（actor / rollout / reference / critic / reward model）。
+    总 GPU 数由两个参数决定：
+  </p>
+  <pre><code>world_size = trainer.nnodes × trainer.n_gpus_per_node</code></pre>
+  <ul class="plain">
+    <li><code>trainer.nnodes</code> — 训练节点数（默认 1）</li>
+    <li><code>trainer.n_gpus_per_node</code> — 每节点 GPU 数（默认 8）</li>
+  </ul>
+  <p>
+    默认 <code>actor_rollout_ref.hybrid_engine=true</code>：actor（训练）与 rollout（推理引擎）<strong>共置</strong>在
+    同一组 GPU 上，通过 sleep/wake 在「生成」和「更新」两个阶段间切换显存占用。ref、critic、reward
+    也各自拥有覆盖全部 GPU 的 worker group。因此<strong>同一时刻每个角色都独占全部 world_size 张卡</strong>，
+    并行度参数描述的是「这个角色内部的切分方式」，而不是角色之间的分配。
+  </p>
+  <div class="note">
+    <b>异步模式：</b><code>trainer.v1.trainer_mode</code> 可选 <code>sync</code>（默认）/
+    <code>colocate_async</code> / <code>separate_async</code>。separate_async 下 rollout 使用
+    <strong>独立 GPU 池</strong>（<code>actor_rollout_ref.rollout.nnodes</code> /
+    <code>rollout.n_gpus_per_node</code>），此时训练与推理的 GPU 预算才真正分开。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="engine">
+  <h2>2. 训练后端选择：FSDP 还是 Megatron</h2>
+  <p>
+    verl 通过 <code>model_engine</code> 选择训练后端，决定后续所有引擎参数的命名空间：
+  </p>
+  <table>
+    <thead>
+      <tr><th>model_engine</th><th>引擎参数命名空间</th><th>适用场景</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>dp</code>（默认，PyTorch FSDP）</td>
+        <td><code>actor_rollout_ref.actor.fsdp_config.*</code></td>
+        <td>≤ 70B 常用；上手简单，FSDP2 + torch.compile 吞吐不差；MoE 大模型支持有限</td>
+      </tr>
+      <tr>
+        <td><code>megatron</code></td>
+        <td><code>actor_rollout_ref.actor.megatron.*</code></td>
+        <td>超大模型 / 大规模集群；TP+PP+EP 组合、分布式优化器、MoE（DeepEP 等）</td>
+      </tr>
+      <tr>
+        <td><code>torchtitan</code> / <code>veomni</code></td>
+        <td><code>*.torchtitan.*</code> / <code>*.veomni.*</code></td>
+        <td>较新的后端，覆盖面较小，本文不展开</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    注意在 verl 新版配置里不再直接写 <code>actor_rollout_ref.actor.strategy</code>，而是 hydra 启动参数
+    <code>model_engine=megatron</code>（等价于 actor.strategy=megatron + 加载 megatron 引擎配置组）。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="fsdp">
+  <h2>3. FSDP 后端：fsdp_size 与 Ulysses 序列并行</h2>
+
+  <h3>3.1 fsdp_size：分片粒度</h3>
+  <p>
+    FSDP 后端没有 TP/PP 概念，模型权重/梯度/优化器状态沿 <strong>DP 维度分片</strong>。
+    <code>fsdp_config.fsdp_size</code> 决定一个分片组包含多少张卡（源码
+    <code>verl/workers/engine/fsdp/utils.py: create_device_mesh</code>）：
+  </p>
+  <table>
+    <thead>
+      <tr><th>fsdp_size</th><th>device mesh</th><th>语义</th><th>通信范围</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>-1</code>（默认）或 ≥ world_size</td>
+        <td><code>(world,)</code></td>
+        <td>全分片（ZeRO-3）：参数在全部卡间分片，每卡持有 1/N</td>
+        <td>all-gather / reduce-scatter 全局</td>
+      </tr>
+      <tr>
+        <td><code>0 &lt; fsdp_size &lt; world</code></td>
+        <td><code>(world//fsdp_size, fsdp_size)</code></td>
+        <td>Hybrid Shard（ZeRO-2+）：fsdp_size 张卡组成一个分片组，组间纯数据并行</td>
+        <td>通信限制在分片组内（通常对齐单机 8 卡）</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>于是 FSDP 后端的有效数据并行度为：</p>
+  <pre><code>DP = world_size / fsdp_size        （fsdp_size=-1 时即 world_size）
+DP_effective = DP / ulysses_sp     （再除以序列并行度）</code></pre>
+  <div class="tip">
+    <b>怎么选：</b>默认全分片最省显存；单机内带宽好、跨机带宽差时，把 <code>fsdp_size</code> 设为
+    每节点 GPU 数（如 8、16），可把通信限制在机内并减少跨机 all-gather，往往更快。
+  </div>
+
+  <h3>3.2 ulysses_sequence_parallel_size：序列并行（长序列）</h3>
+  <p>
+    序列长度 &gt; 32k 时，即使 micro-batch=1，单条序列的激活与 logits 也可能 OOM。FSDP 后端用
+    <strong>Ulysses 序列并行</strong>把一条序列沿 sequence 维切到 sp 张卡上：
+  </p>
+  <ul class="plain">
+    <li><code>fsdp_config.ulysses_sequence_parallel_size = sp &gt; 1</code></li>
+    <li>mesh 变为 <code>(dp, sp)</code>；head 维度需能被 sp 整除（attention head 在 sp 间切分）</li>
+    <li>要求 <code>model.use_remove_padding=True</code>（THD 打包路径），否则报错</li>
+    <li>开启后需要相应调小 <code>*max_token_len_per_gpu</code> 等每卡 token 预算（见性能篇）</li>
+  </ul>
+
+  <h3>3.3 其他 FSDP 引擎参数</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>fsdp_config.strategy</code></td><td><code>fsdp</code></td><td>可选 <code>fsdp2</code>（推荐，平均省 ~7% 显存、+1.5% 吞吐）、<code>fsdp_turbo</code></td></tr>
+      <tr><td><code>fsdp_config.param_offload</code></td><td><code>false</code></td><td>参数 offload 到 CPU，换速度省显存</td></tr>
+      <tr><td><code>fsdp_config.optimizer_offload</code></td><td><code>false</code></td><td>优化器状态 offload 到 CPU</td></tr>
+      <tr><td><code>fsdp_config.reshard_after_forward</code></td><td><code>true</code></td><td>FSDP1 中设 false 等价 SHARD_GRAD_OP（前向后不重分片，省 all-gather 但更费显存）</td></tr>
+      <tr><td><code>fsdp_config.forward_prefetch</code></td><td><code>false</code></td><td>FSDP1 预取下一次前向的 all-gather，通信/计算重叠提速</td></tr>
+      <tr><td><code>fsdp_config.use_no_sync_for_gradient_accumulation</code></td><td><code>false</code></td><td>梯度累积时只在最后一个 micro-batch 同步梯度（M 次 → 1 次通信），峰值显存上升</td></tr>
+      <tr><td><code>fsdp_config.dtype</code></td><td><code>bfloat16</code></td><td>混合精度参数 dtype</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="megatron">
+  <h2>4. Megatron 后端：TP / PP / CP / EP / ETP</h2>
+  <p>
+    Megatron 后端参数位于 <code>actor_rollout_ref.actor.megatron.*</code>，满足基本约束：
+  </p>
+  <pre><code>world_size = TP × PP × CP × DP          （稠密模型）
+EP 从 DP 维度再切分（MoE）：world_size = TP × PP × CP × EP × DP_dense
+  其中 expert 权重按 EP 分片，dense 权重按 DP 分片</code></pre>
+
+  <h3>4.1 五种并行各自切什么</h3>
+  <table>
+    <thead><tr><th>参数</th><th>切分对象</th><th>作用与代价</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>tensor_model_parallel_size</code> (TP)</td>
+        <td>层内权重矩阵</td>
+        <td>每参数显存 ÷ TP；引入每层 all-reduce，跨机 TP 通信代价大，尽量 ≤ 单机 GPU 数（NVLink 域）</td>
+      </tr>
+      <tr>
+        <td><code>pipeline_model_parallel_size</code> (PP)</td>
+        <td>按 transformer 层切到不同 stage</td>
+        <td>每参数显存 ÷ PP；通信量小（只传激活），但有 bubble；用 micro-batch 数与 virtual pipeline 缓解</td>
+      </tr>
+      <tr>
+        <td><code>context_parallel_size</code> (CP)</td>
+        <td>序列维度</td>
+        <td>长序列专用：激活、logits 随序列长度 ÷ CP；attention 计算需跨 CP 通信。可配 <code>dynamic_context_parallel=True</code> 按实际长度动态调度（需设 <code>max_seqlen_per_dp_cp_rank</code>）</td>
+      </tr>
+      <tr>
+        <td><code>expert_model_parallel_size</code> (EP)</td>
+        <td>MoE 专家</td>
+        <td>专家权重 ÷ EP；适合 MoE 模型（如 64×A100 跑 DeepSeek-V3 级别用 EP=32）</td>
+      </tr>
+      <tr>
+        <td><code>expert_tensor_parallel_size</code> (ETP)</td>
+        <td>单个专家内部</td>
+        <td>专家内部张量并行；<code>null</code>（默认）= 与 TP 相同。建议与 TP 对齐</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>4.2 关键开关</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>sequence_parallel</code></td><td><code>True</code></td><td>Megatron SP（LayerNorm/dropout 沿序列切分，配合 TP&gt;1 使用），建议保持开启</td></tr>
+      <tr><td><code>use_distributed_optimizer</code></td><td><code>True</code></td><td>优化器状态沿 DP 分片（类 ZeRO-1），大模型必开</td></tr>
+      <tr><td><code>virtual_pipeline_model_parallel_size</code></td><td><code>null</code></td><td>虚拟流水线（interleaved 1F1B），降低 PP bubble，需配足够 micro-batch</td></tr>
+      <tr><td><code>use_megatron_fsdp</code></td><td><code>False</code></td><td>Megatron-FSDP（ZeRO-3 分片）路径</td></tr>
+      <tr><td><code>param_offload</code> / <code>optimizer_offload</code></td><td><code>False</code></td><td>参数 / 优化器状态 CPU offload；param_offload 还会在 actor 空闲期释放梯度 buffer</td></tr>
+      <tr><td><code>override_transformer_config.recompute_*</code></td><td><code>core_attn</code> selective</td><td>梯度检查点：<code>recompute_granularity=full</code> + <code>recompute_method=uniform</code> 最省显存，代价约 30% 重计算</td></tr>
+      <tr><td><code>use_remove_padding</code></td><td><code>True</code></td><td>THD 序列打包（去 padding），保持开启</td></tr>
+    </tbody>
+  </table>
+
+  <div class="warn">
+    <b>PP 层数整除：</b>transformer 层数必须能被 PP 整除，否则需用
+    <code>override_transformer_config.num_layers_in_first/last_pipeline_stage</code>、
+    <code>account_for_embedding_in_pipeline_split</code> 等手动指定切分。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="rollout">
+  <h2>5. Rollout 推理并行：vLLM / SGLang</h2>
+  <p>
+    rollout 是独立的推理引擎，有自己的并行参数（<code>actor_rollout_ref.rollout.*</code>），
+    <strong>不必与训练后端一致</strong>。引擎共置时每个 rollout replica 占据
+    <code>rollout TP × PP</code> 张卡，replica 数 = <code>world / (TP × PP)</code>。
+  </p>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.tensor_model_parallel_size</code></td><td><code>2</code></td><td>推理 TP。卡数允许时尽量小（TP=1 最好），replica 多 = 吞吐高</td></tr>
+      <tr><td><code>rollout.data_parallel_size</code></td><td><code>1</code></td><td>显式声明 DP replica 划分（与 TP 一起决定切法）</td></tr>
+      <tr><td><code>rollout.expert_parallel_size</code></td><td><code>1</code></td><td>MoE 推理专家并行；vLLM 中 EP=1 表示 fused_moe 的 TP×DP 切分，EP&gt;1（须满足 EP=TP×DP）才真正按专家切</td></tr>
+      <tr><td><code>rollout.pipeline_model_parallel_size</code></td><td><code>1</code></td><td>推理 PP，多数场景不用</td></tr>
+      <tr><td><code>rollout.gpu_memory_utilization</code></td><td><code>0.5</code></td><td>推理引擎可用显存比例（KV cache + 权重）。不开 offload 建议 0.5–0.7；训练侧 offload 全开后可到 0.8–0.9</td></tr>
+      <tr><td><code>rollout.max_num_seqs</code> / <code>max_num_batched_tokens</code></td><td>256 / 8192</td><td>并发请求上限 / 每 batch token 上限，决定解码期有效 batch；参考 <code>max(8192, prompt+response, max_model_len)</code></td></tr>
+      <tr><td><code>rollout.enable_chunked_prefill</code></td><td><code>True</code></td><td>chunked prefill 提升 GPU 利用率，需配合调大 max_num_batched_tokens</td></tr>
+      <tr><td><code>rollout.enforce_eager</code></td><td><code>False</code></td><td>True 关 CUDA graph 省显存（CUDA graph 显存不受 gpu_memory_utilization 约束且无法 offload）</td></tr>
+      <tr><td><code>rollout.cudagraph_capture_sizes</code></td><td><code>null</code></td><td>显存紧张时用小尺寸捕获，如 <code>[1,2,4,8,16,32]</code>，需 enforce_eager=False</td></tr>
+    </tbody>
+  </table>
+
+  <h3>5.1 KV cache 容量估算</h3>
+  <p>选 rollout TP 时官方给出的经验判据（bf16/fp16 权重）：</p>
+  <pre><code>单卡显存(bytes) × gpu_memory_utilization × rollout_TP &gt; 2 × 参数个数</code></pre>
+  <p>
+    即 TP 张卡的总可用显存要装得下 bf16 权重（每参数 2 bytes）并留出同步余量，剩余部分全部做 KV cache。
+    在此基础上 <strong>TP 尽量小</strong>：HybridFlow 论文（arXiv:2409.19256）实验表明，
+    同样卡数下「多个小 TP replica」的 DP 吞吐通常优于「一个大 TP replica」，代价是总 KV cache 变多。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="align">
+  <h2>6. 各角色并行度对齐关系</h2>
+  <ul class="plain">
+    <li><strong>ref（参考策略）</strong>：Megatron 路径下 TP/PP/CP/EP/ETP 应与 actor <strong>完全一致</strong>（权重同步按相同切分传输）；offload 策略也建议对齐（actor 开 param_offload 则 ref 也开）。</li>
+    <li><strong>critic</strong>：拥有独立的并行度配置，不必与 actor 相同；但 world_size 约束相同。critic 输出头小（标量 value），micro batch 可以比 actor 更大。</li>
+    <li><strong>rollout</strong>：TP/EP 与训练侧无关，只需满足「权重同步能对上」——verl 会自动按 rollout 的 TP 切分广播 actor 权重。</li>
+    <li><strong>reward model</strong>（如有）：与 critic 类似，独立配置。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="match">
+  <h2>7. 并行度 × 模型规模 × 序列长度的匹配</h2>
+  <p>
+    官方建议的调优顺序（best_practices.rst）：<strong>先加 TP → 放不下再加 PP → 长序列加 CP →
+    MoE 对齐 EP/ETP 与 TP → DP 保持最小并配合 offload</strong>。以下为常见组合的经验起点（单卡 80G，
+    实际以显存监控为准）：
+  </p>
+  <table>
+    <thead>
+      <tr><th>模型规模</th><th>训练后端</th><th>训练并行</th><th>rollout TP</th><th>备注</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>≤ 4B</td>
+        <td><span class="pill fsdp">FSDP</span></td>
+        <td>全分片（fsdp_size=-1），DP=world</td>
+        <td>1</td>
+        <td>8 卡即可跑 PPO/GRPO；优先 DP</td>
+      </tr>
+      <tr>
+        <td>7B–8B</td>
+        <td><span class="pill fsdp">FSDP</span></td>
+        <td>全分片或 fsdp_size=8（Hybrid Shard）</td>
+        <td>1–2</td>
+        <td>官方 GSM8K 基线：rollout TP=2、gpu_mem_util=0.6</td>
+      </tr>
+      <tr>
+        <td>14B</td>
+        <td><span class="pill fsdp">FSDP</span> / <span class="pill megatron">Megatron</span></td>
+        <td>FSDP 全分片；或 Megatron TP=2</td>
+        <td>2</td>
+        <td>FSDP 下 logits（vocab 大）是显存瓶颈，用 dynamic bsz</td>
+      </tr>
+      <tr>
+        <td>32B</td>
+        <td><span class="pill both">两者皆可</span></td>
+        <td>Megatron TP=4 PP=1；FSDP 需 param+optimizer offload</td>
+        <td>4</td>
+        <td>多机 FSDP 优先试 Hybrid Shard</td>
+      </tr>
+      <tr>
+        <td>70B</td>
+        <td><span class="pill megatron">Megatron</span></td>
+        <td>TP=8（单机域），PP=节点数；use_distributed_optimizer=True</td>
+        <td>4–8</td>
+        <td>PP 跨机：通信只传边界激活；配 virtual pipeline 降 bubble</td>
+      </tr>
+      <tr>
+        <td>MoE（如 235B-A22B）</td>
+        <td><span class="pill megatron">Megatron</span></td>
+        <td>TP=8 + EP=专家分片，ETP 对齐 TP；参考 DAPO+Qwen3-235B 最佳实践</td>
+        <td>TP=8 或 EP&gt;1</td>
+        <td>MoE 显存大头是专家权重，EP 优先于 TP；DeepEP 跨机 EP 可提速</td>
+      </tr>
+      <tr>
+        <td>长序列 &gt; 32k</td>
+        <td><span class="pill both">两者皆可</span></td>
+        <td>FSDP: ulysses_sp=2–8；Megatron: CP=2–8</td>
+        <td>不受影响</td>
+        <td>同时把 <code>*max_token_len_per_gpu</code> 除以 SP/CP</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>7.1 显存快速估算（bf16 训练 + Adam）</h3>
+  <pre><code>参数   P 个参数：权重 2P bytes（÷ TP×PP，FSDP 下 ÷ fsdp 组）
+梯度   2P bytes（同上分片）
+优化器 fp32 master 权重 + m + v = 12P bytes
+       → Megatron use_distributed_optimizer 或 FSDP 全分片后 ÷ DP
+激活   ≈ micro_batch_tokens × hidden × layers × k（k 与是否开 checkpointing 强相关，
+        开 full recompute 后每层只存输入，可降一个数量级）
+logits ≈ tokens × vocab × (2~7) bytes  ← PPO 的额外大头，entropy/log-prob 计算峰值</code></pre>
+  <p>
+    例：70B 模型、bf16、Adam —— 静态部分 ≈ (2+2+12)×70G = 1120 GB，单机 8×80G=640G 放不下，
+    必须分片：TP=8×PP=2 后每卡 70GB 静态 + 激活，刚好达到上限，因此 70B 典型配置再加 offload 留余量。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="params">
+  <h2>8. 并行参数速查表</h2>
+  <p>
+    <span class="pill fsdp">FSDP</span>=仅 FSDP 后端
+    <span class="pill megatron">Megatron</span>=仅 Megatron 后端
+    <span class="pill both">通用</span>
+    <span class="pill rollout">Rollout</span>=推理引擎
+  </p>
+  <table>
+    <thead><tr><th>参数</th><th>后端</th><th>默认</th><th>一句话说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>trainer.nnodes</code> / <code>trainer.n_gpus_per_node</code></td><td><span class="pill both">通用</span></td><td>1 / 8</td><td>决定 world_size；须与集群分配一致</td></tr>
+      <tr><td><code>model_engine</code></td><td><span class="pill both">通用</span></td><td><code>dp</code></td><td>训练后端：dp(FSDP) / megatron / torchtitan / veomni</td></tr>
+      <tr><td><code>actor_rollout_ref.hybrid_engine</code></td><td><span class="pill both">通用</span></td><td><code>true</code></td><td>训练/推理共置；仅 separate_async 模式可 false</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.fsdp_config.fsdp_size</code></td><td><span class="pill fsdp">FSDP</span></td><td>-1</td><td>分片组大小；-1 全分片，8=机内 Hybrid Shard</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size</code></td><td><span class="pill fsdp">FSDP</span></td><td>1</td><td>长序列 SP；需 use_remove_padding=True</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.fsdp_config.strategy</code></td><td><span class="pill fsdp">FSDP</span></td><td>fsdp</td><td>fsdp2 更省显存更快；fsdp_turbo 实验性</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.tensor_model_parallel_size</code></td><td><span class="pill megatron">Megatron</span></td><td>1</td><td>TP；建议 ≤ 单机 GPU 数</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.pipeline_model_parallel_size</code></td><td><span class="pill megatron">Megatron</span></td><td>1</td><td>PP；层数须整除，或手动指定切分</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.context_parallel_size</code></td><td><span class="pill megatron">Megatron</span></td><td>1</td><td>序列并行；长序列用；可配 dynamic_context_parallel</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.expert_model_parallel_size</code></td><td><span class="pill megatron">Megatron</span></td><td>1</td><td>MoE 专家并行</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.expert_tensor_parallel_size</code></td><td><span class="pill megatron">Megatron</span></td><td>null</td><td>专家内 TP；null=同 TP</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.virtual_pipeline_model_parallel_size</code></td><td><span class="pill megatron">Megatron</span></td><td>null</td><td>interleaved 1F1B，降 PP bubble</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.use_distributed_optimizer</code></td><td><span class="pill megatron">Megatron</span></td><td>True</td><td>优化器状态沿 DP 分片，保持开启</td></tr>
+      <tr><td><code>actor_rollout_ref.actor.megatron.param_offload</code> / <code>optimizer_offload</code></td><td><span class="pill megatron">Megatron</span></td><td>False</td><td>CPU offload；显存不够时逐级开启</td></tr>
+      <tr><td><code>actor_rollout_ref.rollout.tensor_model_parallel_size</code></td><td><span class="pill rollout">Rollout</span></td><td>2</td><td>推理 TP；越小副本越多吞吐越高</td></tr>
+      <tr><td><code>actor_rollout_ref.rollout.data_parallel_size</code></td><td><span class="pill rollout">Rollout</span></td><td>1</td><td>推理 DP replica 划分</td></tr>
+      <tr><td><code>actor_rollout_ref.rollout.expert_parallel_size</code></td><td><span class="pill rollout">Rollout</span></td><td>1</td><td>MoE 推理 EP；vLLM 中须满足 EP=TP×DP</td></tr>
+      <tr><td><code>actor_rollout_ref.rollout.gpu_memory_utilization</code></td><td><span class="pill rollout">Rollout</span></td><td>0.5</td><td>推理引擎显存占比；offload 后可 0.8–0.9</td></tr>
+      <tr><td><code>actor_rollout_ref.rollout.nnodes</code> / <code>n_gpus_per_node</code></td><td><span class="pill rollout">Rollout</span></td><td>0</td><td>separate_async 模式的独立 rollout 池规模</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>docs/perf/best_practices.rst</code>、<code>docs/perf/perf_tuning.rst</code>、
+  <code>verl/trainer/config/{engine,model_engine,actor,rollout}/*.yaml</code>、
+  <code>verl/workers/engine/fsdp/utils.py</code> ·
+  下一篇：<a href="memory.html">显存与 OOM 规避</a>
+</footer>
+
+</div>
+</body>
+</html>
