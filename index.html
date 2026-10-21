@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>verl 强化后训练知识库</title>
+  <meta name="description" content="基于 verl 官方文档与代码仓整理的训练参数知识库：并行策略配置、模型规模与数据匹配、防 OOM、训练提速。">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-soft: rgba(88, 166, 255, 0.12);
+      --green: #3fb950;
+      --tag-bg: #21262d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .container { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+
+    /* Hero */
+    header {
+      border-bottom: 1px solid var(--border);
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(88, 166, 255, 0.15), transparent),
+        var(--bg);
+      padding: 72px 0 48px;
+      text-align: center;
+    }
+    header h1 { font-size: 2.4rem; font-weight: 700; letter-spacing: -0.02em; }
+    header h1 .hl { color: var(--accent); }
+    header p.sub { color: var(--text-muted); font-size: 1.1rem; margin-top: 16px; max-width: 720px; margin-left: auto; margin-right: auto; }
+    .badges { margin-top: 24px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    .badge {
+      background: var(--tag-bg);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 14px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .badge b { color: var(--text); font-weight: 600; }
+
+    /* Sections */
+    section { padding: 48px 0; }
+    section h2 {
+      font-size: 1.4rem;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    section h2::before {
+      content: "";
+      display: inline-block;
+      width: 4px;
+      height: 20px;
+      background: var(--accent);
+      border-radius: 2px;
+    }
+    section p.desc { color: var(--text-muted); margin-bottom: 24px; }
+
+    /* Doc cards */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); text-decoration: none; }
+    .card .card-title { font-size: 1.05rem; font-weight: 600; color: var(--text); }
+    .card .card-desc { font-size: 0.9rem; color: var(--text-muted); flex: 1; }
+    .card .card-meta { font-size: 0.78rem; color: var(--text-muted); display: flex; align-items: center; gap: 8px; }
+    .status {
+      font-size: 0.72rem;
+      padding: 2px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+    }
+    .status.wip { color: #d29922; border-color: rgba(210, 153, 34, 0.4); background: rgba(210, 153, 34, 0.08); }
+    .status.done { color: var(--green); border-color: rgba(63, 185, 80, 0.4); background: rgba(63, 185, 80, 0.08); }
+
+    /* Resources */
+    .links { list-style: none; }
+    .links li {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 10px;
+      padding: 14px 20px;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .links .url { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.8rem; color: var(--text-muted); }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 32px 0;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1>verl <span class="hl">强化后训练</span>知识库</h1>
+    <p class="sub">
+      基于 verl 官方文档与代码仓整理的训练参数手册 ——
+      覆盖并行策略（TP / PP / DP / CP / EP）、模型规模与数据量的组合匹配、
+      显存预算与 OOM 规避，以及训练吞吐优化。
+    </p>
+    <div class="badges">
+      <span class="badge">框架 <b>verl</b></span>
+      <span class="badge">后训练 <b>RL / PPO / GRPO</b></span>
+      <span class="badge">目标 <b>不 OOM 的前提下最大化训练速度</b></span>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+
+  <section id="docs">
+    <h2>文档目录</h2>
+    <p class="desc">按主题组织的参数手册，持续更新中。</p>
+    <div class="grid">
+      <a class="card" href="docs/quickstart.html">
+        <span class="card-title">快速开始</span>
+        <span class="card-desc">verl 安装、首个 PPO/GRPO 训练任务、最小可运行配置。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/parallelism.html">
+        <span class="card-title">并行策略详解</span>
+        <span class="card-desc">TP / PP / DP / CP / EP 参数含义、FSDP 与 Megatron 后端差异、worker 分组机制。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/params-training.html">
+        <span class="card-title">训练核心参数</span>
+        <span class="card-desc">optimizer、lr scheduler、KL 控制、loss 裁剪、entropy bonus 等算法与优化器参数。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/params-rollout.html">
+        <span class="card-title">Rollout 参数</span>
+        <span class="card-desc">vLLM / SGLang 推理引擎配置、生成长度、批量、KV cache、sleep/wake 机制。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/memory.html">
+        <span class="card-title">显存与 OOM 规避</span>
+        <span class="card-desc">activation checkpointing、CPU offload、权重/梯度/优化器状态的显存估算公式。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/performance.html">
+        <span class="card-title">性能调优</span>
+        <span class="card-desc">并行度与模型规模/数据长度的匹配策略、off-policy 程度、吞吐测量方法。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/recipes.html">
+        <span class="card-title">配置实例（Recipes）</span>
+        <span class="card-desc">0.5B → 70B 各量级模型的推荐配置，附实际验证过的 bash 脚本。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+      <a class="card" href="docs/faq.html">
+        <span class="card-title">FAQ 与踩坑记录</span>
+        <span class="card-desc">常见报错（NCCL hang、OOM、loss NaN）、排查路径与修复方法。</span>
+        <span class="card-meta"><span class="status wip">撰写中</span></span>
+      </a>
+    </div>
+  </section>
+
+  <section id="resources">
+    <h2>参考资料</h2>
+    <p class="desc">本知识库的一手来源。</p>
+    <ul class="links">
+      <li>
+        <a href="https://verl.readthedocs.io/en/latest/" target="_blank" rel="noopener">verl 官方文档</a>
+        <span class="url">verl.readthedocs.io</span>
+      </li>
+      <li>
+        <a href="https://github.com/volcengine/verl" target="_blank" rel="noopener">verl GitHub 仓库</a>
+        <span class="url">github.com/volcengine/verl</span>
+      </li>
+    </ul>
+  </section>
+
+</main>
+
+<footer>
+  <div class="container">
+    verl 强化后训练知识库 · 持续更新 ·
+    <a href="https://github.com/oashua/verl_knowledge" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</footer>
+
+</body>
+</html>
