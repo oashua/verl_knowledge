@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>显存与 OOM 规避 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 显存管理手册：权重/梯度/优化器/激活/logits 显存估算公式、offload 层级、gradient checkpointing、rollout 显存控制、OOM 分阶段排查路径。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>显存与 OOM 规避</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 核心篇</div>
+  <h1>显存与 OOM 规避</h1>
+  <div class="meta">
+    基于 verl 官方文档 <code>docs/perf/perf_tuning.rst</code>、<code>docs/perf/best_practices.rst</code> 与
+    <code>verl/trainer/config/</code> 整理（2025-10 main 分支）。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#anatomy">显存都花在哪：RL 训练的五个阶段</a></li>
+    <li><a href="#formula">显存估算公式</a></li>
+    <li><a href="#static">静态显存优化：分片与 offload</a></li>
+    <li><a href="#activation">激活与 logits：checkpointing 与动态 batch</a></li>
+    <li><a href="#rollout-mem">Rollout 侧显存控制</a></li>
+    <li><a href="#ladder">OOM 降级阶梯（推荐顺序）</a></li>
+    <li><a href="#troubleshoot">分阶段 OOM 排查表</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="anatomy">
+  <h2>1. 显存都花在哪：RL 训练的五个阶段</h2>
+  <p>
+    与 SFT 不同，RL 后训练在一个 step 里让 <strong>同一批 GPU 轮流扮演不同角色</strong>
+    （hybrid engine 共置模式），每个阶段的显存画像完全不同。OOM 排查的第一步永远是：
+    <strong>确认到底是哪个阶段 OOM</strong>——看报错堆栈中的 worker 函数名：
+  </p>
+  <table>
+    <thead>
+      <tr><th>阶段</th><th>堆栈特征</th><th>显存大头</th><th>可控参数</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>① Rollout 生成</td>
+        <td><code>generate_sequences</code> / vLLM、SGLang 内部</td>
+        <td>推理权重 + KV cache + CUDA graph</td>
+        <td><code>rollout.gpu_memory_utilization</code>、<code>enforce_eager</code> 等</td>
+      </tr>
+      <tr>
+        <td>② 旧策略算 log-prob</td>
+        <td><code>actor_rollout_ref.rollout ... compute_log_prob</code></td>
+        <td>前向激活 + logits（无梯度）</td>
+        <td><code>rollout.log_prob_micro_batch_size_per_gpu</code> / <code>log_prob_max_token_len_per_gpu</code></td>
+      </tr>
+      <tr>
+        <td>③ Ref 算 log-prob</td>
+        <td><code>ref ... compute_log_prob</code></td>
+        <td>同上 + ref 权重</td>
+        <td><code>ref.log_prob_*</code>、<code>ref.*.param_offload</code></td>
+      </tr>
+      <tr>
+        <td>Critic / RM 前向</td>
+        <td><code>compute_values</code> / <code>compute_rm_score</code></td>
+        <td>critic/RM 权重 + 激活</td>
+        <td><code>critic.forward_micro_batch_size_per_gpu</code> 等</td>
+      </tr>
+      <tr>
+        <td>④ Actor 更新（最常见）</td>
+        <td><code>update_policy</code> / <code>update_actor</code></td>
+        <td>权重 + 梯度 + Adam 状态 + 反向激活 + logits</td>
+        <td><code>actor.ppo_micro_batch_size_per_gpu</code> / <code>ppo_max_token_len_per_gpu</code>、offload、recompute</td>
+      </tr>
+      <tr>
+        <td>⑤ 权重同步</td>
+        <td><code>update_weights</code> / broadcast</td>
+        <td>临时全量权重 buffer</td>
+        <td><code>rollout.load_format</code>、<code>rollout.layered_summon</code></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="formula">
+  <h2>2. 显存估算公式</h2>
+
+  <h3>2.1 静态部分（权重 + 梯度 + 优化器状态）</h3>
+  <p>以 P 个参数、bf16 混合精度训练 + Adam 为例（不分片时单副本总量）：</p>
+  <pre><code>权重      bf16      2P bytes
+梯度      bf16      2P bytes
+优化器    fp32 master 权重 4P + AdamW 动量 4P + 方差 4P = 12P bytes
+─────────────────────────────────────────────
+合计 16P bytes
+
+例：7B  → 112 GB   （80G 单卡放不下，必须分片或 offload）
+   70B → 1120 GB
+   分片后每卡 ≈ 16P / (TP×PP×DP_shard)，再减去 offload 掉的部分</code></pre>
+  <ul class="plain">
+    <li>FSDP 全分片（<code>fsdp_size=-1</code>）：三类状态均 ÷ world_size</li>
+    <li>Megatron：权重/梯度 ÷ (TP×PP)，优化器状态在 <code>use_distributed_optimizer=True</code> 时 ÷ DP</li>
+    <li>GRPO 无 critic，且 <code>use_kl_loss=False</code>（如 DAPO 配置）时 ref 角色整体不创建，静态显存大幅下降</li>
+    <li>Critic 通常与 actor 同规模（value head 模型），总预算要按「actor + critic 各一份静态显存」计算</li>
+  </ul>
+
+  <h3>2.2 动态部分（激活 + logits）</h3>
+  <pre><code>激活   ≈ micro_batch_tokens × hidden_size × num_layers × k
+        k ≈ 10–34 bytes/element（不开 checkpointing）
+        开 full recompute 后：每层只存 1 份输入 ≈ 2 bytes/element，降一个数量级
+logits ≈ micro_batch_tokens × vocab_size × (2~7) bytes
+        2 = 只算 log-prob；再加 fp32 softmax/中间量峰值可达 7
+例：Qwen3-8B（vocab=151k）、micro batch 4096 tokens 时
+     logits 一项 ≈ 4096 × 151k × 2 ≈ 1.2 GB，峰值路径下 &gt; 4 GB</code></pre>
+  <p>
+    logits 是 RL 特有的显存杀手（SFT 中交叉熵可 chunk 化，RL 的 log-ratio 计算曾长期全量物化），
+    也是「actor 的 micro batch 必须比 critic/RM 小」的根本原因。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="static">
+  <h2>3. 静态显存优化：分片与 offload</h2>
+  <p>按「代价从小到大」排序的静态显存手段：</p>
+
+  <table>
+    <thead><tr><th>手段</th><th>参数</th><th>代价</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>换 FSDP2</td>
+        <td><code>actor_rollout_ref.actor.fsdp_config.strategy=fsdp2</code></td>
+        <td>几乎无</td>
+        <td>官方基准：平均省 ~7% 显存、+1.5% 吞吐，Transformer 架构推荐直接用</td>
+      </tr>
+      <tr>
+        <td>Megatron 分布式优化器</td>
+        <td><code>...actor.megatron.use_distributed_optimizer=True</code>（默认开）</td>
+        <td>多一轮 grad all-gather</td>
+        <td>优化器状态 ÷ DP</td>
+      </tr>
+      <tr>
+        <td>激活 offload（FSDP）</td>
+        <td><code>actor_rollout_ref.model.enable_activation_offload=True</code></td>
+        <td>D2H/H2D 拷贝</td>
+        <td>配合 checkpointing 用，可获得更大 micro batch；目前仅 FSDP 后端</td>
+      </tr>
+      <tr>
+        <td>优化器状态 offload</td>
+        <td><code>...actor.fsdp_config.optimizer_offload=True</code> 或 <code>...actor.megatron.optimizer_offload=True</code></td>
+        <td>step 变慢明显</td>
+        <td>省 12P/分片数。Megatron 还可部分 offload：<code>+...optim.override_optimizer_config.optimizer_offload_fraction=1</code>（DeepSeek 级模型官方建议开）</td>
+      </tr>
+      <tr>
+        <td>参数 offload</td>
+        <td><code>...actor.fsdp_config.param_offload=True</code> / <code>...actor.megatron.param_offload=True</code></td>
+        <td>每次 forward 前 H2D 搬回</td>
+        <td>省 2P/分片数。Megatron 版本还会在 actor 空闲期释放梯度 buffer。ref 权重建议与 actor 同步开启</td>
+      </tr>
+      <tr>
+        <td>FSDP2 offload_policy</td>
+        <td><code>...actor.fsdp_config.offload_policy=true</code></td>
+        <td>中等</td>
+        <td>FSDP2 专用：训练期间 param/grad/optimizer 三态动态 offload</td>
+      </tr>
+      <tr>
+        <td>QAT / 低精度</td>
+        <td><code>...actor.qat.enable=true</code>（w4a16）或 rollout <code>quantization.*</code></td>
+        <td>数值风险</td>
+        <td>实验性，权重 4bit 化</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="warn">
+    <b>offload 与 rollout 的联动：</b>训练侧 param/optimizer offload 全开之后，
+    <code>rollout.gpu_memory_utilization</code> 才能从 0.5–0.6 提到 0.8–0.9。
+    只调一边都可能 OOM 或浪费显存。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="activation">
+  <h2>4. 激活与 logits：checkpointing 与动态 batch</h2>
+
+  <h3>4.1 梯度检查点</h3>
+  <ul class="plain">
+    <li>FSDP：<code>actor_rollout_ref.model.enable_gradient_checkpointing=True</code>（critic 同：<code>critic.model.enable_gradient_checkpointing=True</code>）</li>
+    <li>Megatron：<code>+...actor.megatron.override_transformer_config.recompute_granularity=full recompute_method=uniform</code>；
+      默认 <code>recompute_modules=["core_attn"]</code> 为选择性重计算（性能干扰最小），全量重计算更省显存但慢 ~30%</li>
+  </ul>
+
+  <h3>4.2 micro batch 与动态 batch</h3>
+  <p>
+    固定 micro batch 按样本数切：<code>actor.ppo_micro_batch_size_per_gpu</code>；由于 RL 样本长度差异极大
+    （长思维链 vs 短回答），固定样本数会导致实际 token 数波动 → 显存时紧时松。
+    <strong>动态 batch（序列打包）按 token 预算切</strong>，是既省显存又提吞吐的首选：
+  </p>
+  <pre><code>actor_rollout_ref.actor.use_dynamic_bsz=True
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576      # 官方 8B 基线值
+actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576
+actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576</code></pre>
+  <p>token 预算经验值（来自官方 perf_tuning）：</p>
+  <ul class="plain">
+    <li>actor 的 <code>ppo_max_token_len_per_gpu</code>：≥ 2×(max_prompt_length + max_response_length)，尽量调大</li>
+    <li>仅前向的角色（rollout/ref 的 log-prob、critic/RM forward）可设为 actor 的 <strong>2 倍</strong></li>
+    <li>长序列（&gt; 32k）训练：预算相应除以 SP/CP 并行度，逐级下调避免 OOM</li>
+  </ul>
+
+  <h3>4.3 entropy / logits 分块计算</h3>
+  <p><code>compute_entropy_from_logits</code> 的峰值显存 ≈ <code>tokens × vocab × 7 bytes</code>，两个专用开关：</p>
+  <ul class="plain">
+    <li><code>...actor.entropy_from_logits_with_chunking=True</code>（chunk 默认 2048 行）——前向按块算 entropy</li>
+    <li><code>...actor.entropy_checkpointing=True</code>——训练时对 entropy 计算做重计算（常规 checkpointing 不覆盖此处）</li>
+  </ul>
+  <p>仅 <code>entropy_coeff &gt; 0</code>（需要 entropy 项）时相关；GRPO/DAPO 常用 entropy_coeff=0 可完全绕开。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="rollout-mem">
+  <h2>5. Rollout 侧显存控制</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.gpu_memory_utilization</code></td><td>0.5</td><td>推理引擎总预算。vLLM ≥0.7 按总显存比例；SGLang 按空闲显存中静态部分的比例（语义不同，换引擎别照抄数值）</td></tr>
+      <tr><td><code>rollout.free_cache_engine</code></td><td>True</td><td>生成结束后释放 KV cache——hybrid 模式下训练阶段显存的来源，保持开启</td></tr>
+      <tr><td><code>rollout.enforce_eager</code></td><td>False</td><td>True = 关 CUDA graph。CUDA graph 显存不受 gpu_memory_utilization 约束、且训练阶段无法 offload，是「明明 util 只有 0.5 还是 OOM」的常见原因</td></tr>
+      <tr><td><code>rollout.cudagraph_capture_sizes</code></td><td>null</td><td>保留 CUDA graph 但只捕获小 batch（如 <code>[1,2,4,8,16,32]</code>），介于性能与显存之间</td></tr>
+      <tr><td><code>rollout.load_format</code></td><td>dummy</td><td>权重同步方式；超大模型可 <code>safetensors</code>（配 <code>data.use_shm=True</code>）</td></tr>
+      <tr><td><code>rollout.layered_summon</code></td><td>False</td><td>分层 summon 权重，防同步阶段 OOM，代价是更慢</td></tr>
+      <tr><td><code>rollout.multi_stage_wake_up</code></td><td>False</td><td>SGLang 专用：多阶段唤醒，降低「训练→推理」切换的显存峰值</td></tr>
+      <tr><td><code>rollout.max_num_batched_tokens</code> / <code>max_model_len</code></td><td>8192 / null</td><td>chunked prefill 开启时二者直接决定 prefill 激活峰值</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Sleep/wake 机制：verl 在训练阶段把推理引擎权重 offload 出去、生成阶段再唤醒。
+    若推理引擎残留显存导致训练 OOM，优先检查 <code>enforce_eager</code>/<code>free_cache_engine</code>，
+    其次降低 <code>gpu_memory_utilization</code>。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="ladder">
+  <h2>6. OOM 降级阶梯（推荐顺序）</h2>
+  <p>遇到 OOM 时按代价从低到高逐级尝试，每改一项重新测一次峰值（不要一次全开）：</p>
+  <ol class="plain">
+    <li><strong>缩小动态 batch 预算</strong>：<code>ppo_max_token_len_per_gpu</code> / <code>log_prob_max_token_len_per_gpu</code> 减半（吞吐损失通常最小）</li>
+    <li><strong>开 gradient checkpointing</strong>（若尚未开）：往往还能换回更大的 micro batch</li>
+    <li><strong>entropy 分块</strong>：<code>entropy_from_logits_with_chunking=True</code>（若用 entropy）</li>
+    <li><strong>rollout 侧</strong>：<code>gpu_memory_utilization</code> 降 0.1 或 <code>enforce_eager=True</code></li>
+    <li><strong>offload</strong>：先 optimizer_offload，再 param_offload（ref 同步开）</li>
+    <li><strong>提高并行分片度</strong>：加 TP/PP（Megatron）或降低 fsdp_size（FSDP）</li>
+    <li><strong>序列并行</strong>：长序列场景上 ulysses SP / CP</li>
+  </ol>
+  <div class="tip">
+    <b>测量工具：</b>开启 <code>global_profiler.tool=torch_memory</code>，OOM 时自动 dump 内存快照
+    （分配栈、各 tensor 大小），比盲猜高效得多。日常监控看 wandb 的
+    <code>actor/optimizer/memory_allocated</code> 等曲线的峰值而非均值。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="troubleshoot">
+  <h2>7. 分阶段 OOM 排查表</h2>
+  <table>
+    <thead><tr><th>现象</th><th>首先检查</th><th>其次</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>生成阶段 OOM（vLLM 报 CUDA OOM）</td>
+        <td><code>gpu_memory_utilization</code> 过高 / 模型放不下 → 升 rollout TP</td>
+        <td><code>max_model_len</code> 过大；chunked prefill 的 <code>max_num_batched_tokens</code></td>
+      </tr>
+      <tr>
+        <td>log_prob 阶段 OOM</td>
+        <td><code>log_prob_micro_batch_size_per_gpu</code> 或 <code>log_prob_max_token_len_per_gpu</code></td>
+        <td>该阶段是纯前向，预算可以是 actor 的 2 倍——反而要防止设小了拖慢</td>
+      </tr>
+      <tr>
+        <td>update_policy 阶段 OOM</td>
+        <td>动态 batch 预算 / checkpointing</td>
+        <td>offload；若手动设过 <code>fsdp_config.use_no_sync_for_gradient_accumulation=true</code>（省通信但会在累积期保留未分片梯度、抬高峰值），改回 false</td>
+      </tr>
+      <tr>
+        <td>训练开始没事，几个 step 后 OOM</td>
+        <td>最长样本是长尾分布 → 峰值由最长序列决定，动态 batch 已缓解；仍 OOM 则降预算</td>
+        <td>内存泄漏类问题用 torch_memory profiler 抓快照</td>
+      </tr>
+      <tr>
+        <td>权重同步阶段 OOM</td>
+        <td><code>rollout.layered_summon=True</code></td>
+        <td><code>load_format=safetensors</code> + <code>data.use_shm=True</code></td>
+      </tr>
+      <tr>
+        <td>NCCL 超时而非 OOM</td>
+        <td>并行度约束被违反（world 不整除、层数不整除）导致部分 rank 挂起</td>
+        <td>检查 <code>TP×PP×CP×DP</code> 与层数整除；必要时调大 <code>actor_rollout_ref.nccl_timeout</code> 便于抓现场</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>docs/perf/perf_tuning.rst</code>、<code>docs/perf/best_practices.rst</code>、
+  <code>verl/workers/engine/fsdp/transformer_impl.py</code>、
+  <code>verl/trainer/config/{engine,actor,rollout}/*.yaml</code> ·
+  相关：<a href="parallelism.html">并行策略详解</a> · 下一篇：<a href="performance.html">性能调优</a>
+</footer>
+
+</div>
+</body>
+</html>
