@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rollout 参数 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl rollout 参数手册：vLLM/SGLang 引擎配置、采样参数、生成长度、并发与 KV cache、log-prob 计算、多轮工具调用、PD 分离与 KV offload。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>Rollout 参数</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 分册</div>
+  <h1>Rollout 参数</h1>
+  <div class="meta">
+    参数命名空间 <code>actor_rollout_ref.rollout.*</code>，默认值取自
+    <code>verl/trainer/config/rollout/rollout.yaml</code>（2025-10 main 分支）。
+    并行与显存相关参数的原理见<a href="parallelism.html">并行篇</a>与<a href="memory.html">显存篇</a>，本页按功能分组速查。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#engine">引擎与模式选择</a></li>
+    <li><a href="#sampling">采样参数</a></li>
+    <li><a href="#length">生成长度</a></li>
+    <li><a href="#mem">显存相关</a></li>
+    <li><a href="#throughput">吞吐相关</a></li>
+    <li><a href="#logprob">log-prob 计算参数</a></li>
+    <li><a href="#multi-turn">多轮工具调用</a></li>
+    <li><a href="#agent">Agent Loop（实验性）</a></li>
+    <li><a href="#weights">权重同步（checkpoint engine）</a></li>
+    <li><a href="#advanced">进阶：PD 分离、KV offload、量化、MTP</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="engine">
+  <h2>1. 引擎与模式选择</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.name</code></td><td>必填</td><td>推理后端：<code>vllm</code> / <code>sglang</code> / <code>trtllm</code> / <code>hf</code>。vLLM 与 SGLang 是主流选择，按基础设施实测挑选</td></tr>
+      <tr><td><code>rollout.mode</code></td><td><code>async</code></td><td><code>sync</code>=LLM 批式接口，<code>async</code>=AsyncLLM。多轮/agent 场景必须 async</td></tr>
+      <tr><td><code>rollout.dtype</code></td><td><code>bfloat16</code></td><td>推理权重 dtype，与训练侧对齐</td></tr>
+      <tr><td><code>rollout.load_format</code></td><td><code>dummy</code></td><td>权重加载方式：<code>dummy</code>（随机初始化，等第一次同步）/ <code>hf</code> / <code>megatron</code> / <code>safetensors</code>（超大模型，配 <code>data.use_shm=True</code>）</td></tr>
+      <tr><td><code>rollout.skip_tokenizer_init</code></td><td><code>True</code></td><td>token-in-token-out，跳过引擎内 tokenizer 初始化</td></tr>
+      <tr><td><code>rollout.seed</code></td><td>42</td><td>vLLM 采样种子</td></tr>
+      <tr><td><code>rollout.engine_kwargs.{vllm,sglang,trtllm}.*</code></td><td>{}</td><td>透传引擎原始 CLI 参数的逃生口，如 <code>+...engine_kwargs.vllm.disable_log_stats=True</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="sampling">
+  <h2>2. 采样参数</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.temperature</code></td><td>1.0</td><td>RL 探索默认 1.0；调低会缩小策略分布，训练信号变弱</td></tr>
+      <tr><td><code>rollout.top_p</code> / <code>top_k</code></td><td>1.0 / -1</td><td>官方建议训练 rollout 保持全分布（top_p=1、top_k=-1）；top_k 语义：-1=vLLM 不限，0=HF 不限</td></tr>
+      <tr><td><code>rollout.n</code></td><td>1</td><td>每 prompt 采样数 = GRPO 组大小 G。GRPO 典型 64，DAPO 16。同时等于 critic/ref/log-prob 的样本放大倍数</td></tr>
+      <tr><td><code>rollout.do_sample</code></td><td>True</td><td>HF rollout 用；False 为贪心</td></tr>
+      <tr><td><code>rollout.ignore_eos</code></td><td>False</td><td>True = 生成到 response_length 上限（测量极限吞吐用）</td></tr>
+      <tr><td><code>rollout.over_sample_rate</code></td><td>0</td><td>过采样提前终止：完成 (1−rate) 比例请求即终止其余（DAPO filter_groups 配合）</td></tr>
+      <tr><td><code>rollout.val_kwargs.*</code></td><td>temp=0</td><td>验证期独立采样参数。小测试集（AIME24）建议 <code>temperature&gt;0</code> + <code>n=64</code> 降方差，起步 <code>temp=1.0, top_p=0.7, n=1</code></td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>验证也要采样：</b>温度设 0 时思维链模型容易重复循环——官方建议验证 <code>temperature &gt; 0</code>。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="length">
+  <h2>3. 生成长度</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.prompt_length</code></td><td>= data.max_prompt_length</td><td>输入上限；数据侧过长报错或按 <code>data.truncation</code> 截断</td></tr>
+      <tr><td><code>rollout.response_length</code></td><td>= data.max_response_length</td><td>生成上限。日志中 clip_ratio &gt; 0.1 通常说明截断过多，应加长或清数据</td></tr>
+      <tr><td><code>rollout.max_model_len</code></td><td>null</td><td>引擎最大序列长度（prompt+response）；null 自动。加大直接增加 KV cache 压力</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="mem">
+  <h2>4. 显存相关</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.gpu_memory_utilization</code></td><td>0.5</td><td>引擎总预算。vLLM≥0.7 按总显存比例，SGLang 按空闲显存中静态部分比例；offload 全开后可 0.8–0.9</td></tr>
+      <tr><td><code>rollout.standalone_gpu_memory_utilization</code></td><td>同上</td><td>separate_async 独立 rollout 池的专用值</td></tr>
+      <tr><td><code>rollout.enforce_eager</code></td><td>False</td><td>True 关 CUDA graph 省显存（慢 ~10%+）</td></tr>
+      <tr><td><code>rollout.cudagraph_capture_sizes</code></td><td>null</td><td>只捕获指定 batch 尺寸的 graph，如 <code>[1,2,4,8,16,32]</code></td></tr>
+      <tr><td><code>rollout.free_cache_engine</code></td><td>True</td><td>生成结束释放 KV cache（hybrid 模式必开）</td></tr>
+      <tr><td><code>rollout.multi_stage_wake_up</code></td><td>False</td><td>SGLang：多阶段唤醒，降低训练→推理切换峰值</td></tr>
+      <tr><td><code>rollout.layered_summon</code></td><td>False</td><td>分层 summon 权重，防同步 OOM，更慢</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="throughput">
+  <h2>5. 吞吐相关</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.tensor_model_parallel_size</code></td><td>2</td><td>越小 replica 越多吞吐越高（详见<a href="parallelism.html#rollout">并行篇 §5</a>）</td></tr>
+      <tr><td><code>rollout.data_parallel_size</code> / <code>expert_parallel_size</code> / <code>pipeline_model_parallel_size</code></td><td>1</td><td>推理 DP/EP/PP；vLLM EP 须满足 EP=TP×DP</td></tr>
+      <tr><td><code>rollout.max_num_seqs</code></td><td>256</td><td>并发请求上限；KV 利用率低时调大</td></tr>
+      <tr><td><code>rollout.max_num_batched_tokens</code></td><td>8192</td><td>每 batch token 上限；经验 <code>max(8192, prompt+response, max_model_len)</code></td></tr>
+      <tr><td><code>rollout.enable_chunked_prefill</code></td><td>True</td><td>chunked prefill；开时需协调 max_num_batched_tokens / max_model_len</td></tr>
+      <tr><td><code>rollout.enable_prefix_caching</code></td><td>True</td><td>prefix KV 复用；GRPO n&gt;1 与多轮场景收益大</td></tr>
+      <tr><td><code>rollout.scheduling_policy</code></td><td>fcfs</td><td>调度策略（vLLM）</td></tr>
+      <tr><td><code>rollout.disable_log_stats</code></td><td>True</td><td><strong>调优期改 False</strong>，看 KV 利用率与并发数</td></tr>
+      <tr><td><code>rollout.ray_actor_max_concurrency</code></td><td>1024</td><td>rollout server actor 并发上限，需高于在途请求数峰值，否则 wake_up/权重同步被饿死</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="logprob">
+  <h2>6. log-prob 计算参数</h2>
+  <p>rollout 引擎只负责生成；<code>π_old</code> 的 log-prob 由训练侧模型前向计算，参数也挂在 rollout 节点下：</p>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.log_prob_micro_batch_size_per_gpu</code></td><td>null</td><td>固定 batch 路径的每卡批大小（纯前向，可设 actor 的 2 倍）</td></tr>
+      <tr><td><code>rollout.log_prob_use_dynamic_bsz</code></td><td>= actor.use_dynamic_bsz</td><td>动态打包（推荐 True）</td></tr>
+      <tr><td><code>rollout.log_prob_max_token_len_per_gpu</code></td><td>= actor.ppo_max_token_len_per_gpu (16384)</td><td>每卡 token 预算；须 ≥ n×max_prompt_length+max_response_length 的整倍数，防止截断</td></tr>
+      <tr><td><code>rollout.calculate_log_probs</code></td><td>True</td><td>记录 rollout 自身 log-prob（truncated importance sampling 等需要时开）</td></tr>
+      <tr><td><code>rollout.logprobs_mode</code></td><td>processed_logprobs</td><td>logprobs 输出模式</td></tr>
+      <tr><td><code>rollout.topk_log_probs</code></td><td>0</td><td>每 token top-k log-probs（rollout_correction score centering 用，vLLM 单轮）</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="multi-turn">
+  <h2>7. 多轮工具调用（multi_turn）</h2>
+  <pre><code>actor_rollout_ref.rollout.name=sglang        # 多轮建议 SGLang
+actor_rollout_ref.rollout.multi_turn.enable=True</code></pre>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>multi_turn.tool_config_path</code></td><td>null</td><td>有状态工具 YAML（每轨迹状态、create/release 生命周期、自定义 reward）</td></tr>
+      <tr><td><code>multi_turn.function_tool_path</code></td><td>null</td><td><code>@function_tool</code> 装饰的无状态工具 Python 文件；与 tool_config_path 可共存（重名报错）</td></tr>
+      <tr><td><code>multi_turn.max_assistant_turns</code> / <code>max_user_turns</code></td><td>null (max_length//3)</td><td>轮数上限</td></tr>
+      <tr><td><code>multi_turn.max_parallel_calls</code></td><td>1</td><td>单轮最多并行工具调用</td></tr>
+      <tr><td><code>multi_turn.max_tool_response_length</code></td><td>256</td><td>工具返回 token 上限；超出按 <code>tool_response_truncate_side</code>（默认 middle）截</td></tr>
+      <tr><td><code>multi_turn.format</code></td><td>hermes</td><td>工具调用协议格式（hermes / llama3_json …）</td></tr>
+      <tr><td><code>multi_turn.use_inference_chat_template</code></td><td>False</td><td>False=用记录的 token ids 训练（含完整输出，训练/推理一致但 prompt 更长）；True=用默认 chat template（贴近生产）</td></tr>
+      <tr><td><code>multi_turn.tokenization_sanity_check_mode</code></td><td>strict</td><td>逐轮 vs 整体分词一致性检查；QwQ/Qwen3 等已知差异模型可设 <code>ignore_strippable</code> 或 <code>disable</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="agent">
+  <h2>8. Agent Loop（实验性）</h2>
+  <p>基于 AgentLoop worker 的异步 agent rollout，适合复杂工具编排：</p>
+  <ul class="plain">
+    <li><code>rollout.agent.num_workers</code>（默认 8）— agent loop worker 数</li>
+    <li><code>rollout.agent.default_agent_loop</code>（默认 single_turn_agent）— 未在数据集标 <code>agent_name</code> 时使用</li>
+    <li><code>rollout.agent.agent_loop_config_path</code> — hydra 实例化配置，注册自定义 loop（react_agent 等）</li>
+    <li><code>rollout.agent.custom_async_server.*</code> — 自定义异步推理服务（如 AsyncvLLMServer）</li>
+    <li><code>rollout.trace.*</code> — 轨迹追踪（mlflow/weave/trackio 后端、token2text、每 worker 每步采样条数）</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="weights">
+  <h2>9. 权重同步（checkpoint engine）</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>rollout.checkpoint_engine.backend</code></td><td>naive</td><td>权重广播后端：naive / nccl / nixl / hccl；大模型多机时 nccl/nixl 显著更快</td></tr>
+      <tr><td><code>rollout.checkpoint_engine.update_weights_bucket_megabytes</code></td><td>2048</td><td>单次权重更新 payload 上限（SGLang）；更大吞吐更高但显存开销增加。TP≥8 时建议同时设 <code>RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1</code> + 手动 <code>CUDA_VISIBLE_DEVICES</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="advanced">
+  <h2>10. 进阶：PD 分离、KV offload、量化、MTP</h2>
+
+  <h3>10.1 PD 分离（SGLang）</h3>
+  <p>长 prompt 场景把 prefill 与 decode 拆到不同 replica：</p>
+  <pre><code>rollout.disaggregation.enabled=True
+rollout.disaggregation.prefill_replicas=1     # 每 replica 占 TP 张卡
+rollout.disaggregation.decode_replicas=1
+rollout.disaggregation.decode_tensor_model_parallel_size=null  # null=同 TP
+rollout.disaggregation.transfer_backend=nixl   # nixl | mooncake | ascend | mori</code></pre>
+
+  <h3>10.2 KV cache offload（Mooncake，vLLM）</h3>
+  <p>
+    把 prefix KV 块 offload 到共享 Mooncake store：长共享前缀（系统提示、工具历史、GRPO 的 n 采样）
+    跨请求/跨 replica 去重，并降低迁移负载时的 re-prefill 成本。需 vLLM ≥ 0.22（旧版本权重更新后可能残留陈旧 KV；
+    verl 每次权重更新会强制清空本地与 Mooncake 缓存）：
+  </p>
+  <pre><code>+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_connector=MooncakeStoreConnector
++actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_role=kv_both
++actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_connector_extra_config.mooncake_config_path=/path/to/mooncake_config.json</code></pre>
+
+  <h3>10.3 低精度 rollout 与 MTP</h3>
+  <ul class="plain">
+    <li><code>rollout.quantization.{linear,moe}</code>（如 <code>FP8_BLOCK</code>）— vLLM/SGLang + Megatron：引擎以量化配置启动，训练侧每次同步前量化权重</li>
+    <li><code>rollout.mtp</code> — multi-token prediction，复用模型配置</li>
+    <li><code>rollout.enable_rollout_routing_replay</code> / <code>moe_load_balance_metrics_interval</code> — MoE 路由记录回放与负载指标</li>
+  </ul>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>verl/trainer/config/rollout/rollout.yaml</code>、<code>docs/perf/perf_tuning.rst</code>、
+  <code>docs/perf/best_practices.rst</code>、<code>docs/perf/rollout_kv_offload.md</code> ·
+  相关：<a href="parallelism.html">并行策略</a> / <a href="memory.html">显存与 OOM</a> / <a href="performance.html">性能调优</a> ·
+  下一篇：<a href="params-training.html">训练核心参数</a>
+</footer>
+
+</div>
+</body>
+</html>
