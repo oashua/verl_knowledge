@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>训练核心参数 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 训练参数手册：算法选择（GAE/GRPO）、数据流 batch、PPO 裁剪与 loss 聚合、KL 控制、optimizer/lr scheduler、critic 参数、PPO/GRPO/DAPO 配方速查。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>训练核心参数</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 分册</div>
+  <h1>训练核心参数</h1>
+  <div class="meta">
+    默认值取自 <code>verl/trainer/config/</code>（ppo_trainer.yaml、actor/critic、optim，2025-10 main 分支）；
+    算法语义依据官方 <code>docs/perf/best_practices.rst</code>（DAPO + Qwen3-235B 实践）。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#algo">算法选择：advantage estimator 与 KL</a></li>
+    <li><a href="#data">数据流参数</a></li>
+    <li><a href="#actor">Actor 更新参数</a></li>
+    <li><a href="#critic">Critic 参数</a></li>
+    <li><a href="#optim">Optimizer 与 LR scheduler</a></li>
+    <li><a href="#trainer">Trainer 杂项与 checkpoint</a></li>
+    <li><a href="#recipes">算法配方速查：PPO / GRPO / DAPO / REINFORCE++</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="algo">
+  <h2>1. 算法选择：advantage estimator 与 KL</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>algorithm.adv_estimator</code></td><td><code>gae</code></td><td>优势估计器：<code>gae</code>（PPO，需 critic）/ <code>grpo</code>（组内归一化）/ <code>reinforce_plus_plus</code> 等。选 gae 以外的值则 critic 默认不创建</td></tr>
+      <tr><td><code>algorithm.gamma</code></td><td>1.0</td><td>折扣因子；LLM RL 常用 1.0（稀疏末位奖励 + 无环境动态）</td></tr>
+      <tr><td><code>algorithm.lam</code></td><td>1.0</td><td>GAE 偏差-方差权衡；同样常用 1.0</td></tr>
+      <tr><td><code>algorithm.norm_adv_by_std_in_grpo</code></td><td>True</td><td>GRPO 组内优势是否除以 std。Dr.GRPO 建议关闭（除 std 会给小方差组放大数据噪声）</td></tr>
+      <tr><td><code>algorithm.use_kl_in_reward</code></td><td>False</td><td>KL 写进 reward（PPO 用）；GRPO/DAPO 用 loss 侧 KL 或完全不用</td></tr>
+      <tr><td><code>algorithm.kl_penalty</code></td><td><code>kl</code></td><td>KL 估计方式：kl / abs / mse(k2) / low_var_kl(k3) / full</td></tr>
+      <tr><td><code>algorithm.kl_ctrl.type</code></td><td><code>fixed</code></td><td><code>fixed</code>：固定系数 kl_coef；<code>adaptive</code>：按 target_kl 自适应（horizon 平滑窗口）</td></tr>
+      <tr><td><code>algorithm.kl_ctrl.kl_coef</code></td><td>0.001</td><td>KL 系数起点；过大抑制探索、过小易 reward hacking</td></tr>
+      <tr><td><code>algorithm.filter_groups.*</code></td><td>enable=False</td><td>DAPO 组过滤（全对/全错组丢弃）：metric 选奖励字段，max_num_gen_batches / max_inflight_gen_batches 控制补采</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>ref 模型何时存在：</b><code>use_kl_in_reward=True</code> 或 <code>actor.use_kl_loss=True</code> 时才创建 reference worker
+    （DAPO 两者皆 False 时 ref 完全不加载，省一份静态显存）。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="data">
+  <h2>2. 数据流参数</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>data.train_files</code> / <code>val_files</code></td><td>gsm8k parquet</td><td>parquet 格式（可列表）；全量读入内存（&lt;100GB）</td></tr>
+      <tr><td><code>data.train_batch_size</code></td><td>1024</td><td>每次迭代的 prompt 数（全局量）；每步实际样本数 = × rollout.n</td></tr>
+      <tr><td><code>data.gen_batch_size</code></td><td>null（=train）</td><td>每次从 dataloader 取的 prompt 数；异步模式可调大攒批</td></tr>
+      <tr><td><code>data.max_prompt_length</code> / <code>max_response_length</code></td><td>512 / 512</td><td>长度上限；日志 clip_ratio&gt;0.1 说明 response 截断过多</td></tr>
+      <tr><td><code>data.truncation</code></td><td><code>error</code></td><td>超长 prompt 处理：error / left / right / middle。常规跑 <code>left</code>，严格验证用 error</td></tr>
+      <tr><td><code>data.filter_overlong_prompts</code></td><td>False</td><td>预过滤超长样本（大数据集配 <code>filter_overlong_prompts_workers</code> 多进程加速）</td></tr>
+      <tr><td><code>data.prompt_key</code> / <code>reward_fn_key</code></td><td>prompt / data_source</td><td>数据列名；data_source 决定用哪个 reward 函数</td></tr>
+      <tr><td><code>data.val_batch_size</code></td><td>null</td><td>验证 batch（null 自动）</td></tr>
+      <tr><td><code>data.shuffle</code> / <code>seed</code></td><td>True / null</td><td>dataloader 打乱与种子</td></tr>
+      <tr><td><code>data.use_shm</code></td><td>False</td><td>共享内存加载数据（safetensors 大模型权重同步时用）</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="actor">
+  <h2>3. Actor 更新参数</h2>
+
+  <h3>3.1 批次结构</h3>
+  <pre><code>train_batch_size × n  ─(PPO epochs)→  ppo_mini_batch_size  ─(累积)→  micro_batch（动态 token 预算）</code></pre>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>actor.ppo_mini_batch_size</code></td><td>256</td><td>一次优化 step 的样本数（全局）；按常规 DL 调法</td></tr>
+      <tr><td><code>actor.ppo_micro_batch_size_per_gpu</code></td><td>null</td><td>每卡前反向批大小；尽量调大至 mini batch 归一化值（性能细节见<a href="performance.html#batch">性能篇 §4</a>）</td></tr>
+      <tr><td><code>actor.ppo_max_token_len_per_gpu</code></td><td>16384</td><td>动态 batch 的每卡 token 预算</td></tr>
+      <tr><td><code>actor.ppo_epochs</code></td><td>1</td><td>数据重用次数；&gt;1 更 off-policy，GRPO/DAPO 通常保持 1</td></tr>
+      <tr><td><code>actor.shuffle</code> / <code>data_loader_seed</code></td><td>False / 42</td><td>epoch 间打乱与切分种子</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.2 策略 loss 与裁剪</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>actor.clip_ratio</code></td><td>0.2</td><td>PPO 对称裁剪 ε</td></tr>
+      <tr><td><code>actor.clip_ratio_low</code> / <code>clip_ratio_high</code></td><td>0.2 / 0.2</td><td>非对称裁剪（DAPO clip-higher）：low=0.2、high=0.28，放宽低概率 token 上探</td></tr>
+      <tr><td><code>actor.clip_ratio_c</code></td><td>3.0</td><td>dual-clip PPO 的 C：advantage&lt;0 且 ratio&gt;C 时额外截断，防早期崩坏</td></tr>
+      <tr><td><code>actor.loss_agg_mode</code></td><td><code>token-mean</code></td><td>loss 聚合：<code>token-mean</code>（Dr.GRPO/DAPO 推荐）/ <code>seq-mean-token-mean</code>（原版 GRPO）/ <code>seq-mean-token-sum</code> 等；配合 <code>loss_scale_factor</code>（null=按 response_length）</td></tr>
+      <tr><td><code>actor.policy_loss.loss_mode</code></td><td><code>vanilla</code></td><td>扩展 loss：clip-cov / kl-cov（GPG，arXiv:2505.22617）/ dro</td></tr>
+      <tr><td><code>actor.entropy_coeff</code></td><td>0</td><td>entropy 正则；&gt;0 时注意显存（见<a href="memory.html#activation">显存篇 §4.3</a>）</td></tr>
+      <tr><td><code>actor.tau_pos</code> / <code>tau_neg</code></td><td>1.0 / 1.05</td><td>SAPO 平滑函数参数（Qwen3-30B-A3B 论文默认）</td></tr>
+      <tr><td><code>actor.use_kl_loss</code></td><td>False</td><td>KL 作为 loss 项（GRPO True / PPO False / DAPO False）</td></tr>
+      <tr><td><code>actor.kl_loss_coef</code></td><td>0.001</td><td>KL loss 权重，起点 0.001</td></tr>
+      <tr><td><code>actor.kl_loss_type</code></td><td><code>low_var_kl</code></td><td>KL 估计（k3 低方差推荐）</td></tr>
+      <tr><td><code>actor.grad_clip</code></td><td>1.0</td><td>梯度范数裁剪（FSDP 路径）</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="critic">
+  <h2>4. Critic 参数</h2>
+  <p>命名空间 <code>critic.*</code>。仅在 <code>adv_estimator=gae</code> 时默认启用（<code>critic.enable</code> 可强制）。</p>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>critic.model.path</code></td><td>—</td><td>critic 初始权重（常与 actor 同底座，另训 value head）</td></tr>
+      <tr><td><code>critic.ppo_mini_batch_size</code> / <code>ppo_epochs</code> / <code>loss_agg_mode</code></td><td>继承 actor</td><td>默认与 actor 联动，可单独覆盖</td></tr>
+      <tr><td><code>critic.ppo_max_token_len_per_gpu</code></td><td>32768</td><td>已是 actor 默认（16384）的 2 倍——critic 输出头是标量，可更大</td></tr>
+      <tr><td><code>critic.cliprange_value</code></td><td>0.5</td><td>value function 裁剪范围</td></tr>
+      <tr><td><code>critic.optim.lr</code></td><td>1e-5</td><td>critic 学习率通常比 actor（1e-6）大一个量级</td></tr>
+      <tr><td><code>trainer.critic_warmup</code></td><td>0</td><td>训练前先单独热身 critic 的迭代数</td></tr>
+      <tr><td><code>critic.strategy</code></td><td>必填</td><td>fsdp / fsdp2 / megatron（可独立于 actor 选择）</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="optim">
+  <h2>5. Optimizer 与 LR scheduler</h2>
+  <p>命名空间 <code>actor.optim.*</code> / <code>critic.optim.*</code>（以及 FSDP 专属扩展在 <code>*.fsdp_config.optim</code> 层，Megatron 专属在 <code>*.megatron.optim</code> 层）。</p>
+  <table>
+    <thead><tr><th>参数</th><th>默认（actor）</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>optim.lr</code></td><td>1e-6</td><td>RL 微调常用 1e-6~1e-5；critic 默认 1e-5</td></tr>
+      <tr><td><code>optim.weight_decay</code></td><td>0.01</td><td>官方实践常用 0.1</td></tr>
+      <tr><td><code>optim.lr_warmup_steps</code></td><td>-1</td><td>优先于 ratio；None/负值回退到 <code>lr_warmup_steps_ratio</code>。常见 10 步或 ratio 0.0~0.1</td></tr>
+      <tr><td><code>optim.clip_grad</code></td><td>1.0</td><td>梯度裁剪，常用 1</td></tr>
+      <tr><td><code>optim.betas</code></td><td>[0.9, 0.999]</td><td>Adam β（FSDP 路径）</td></tr>
+      <tr><td><code>optim.lr_scheduler_type</code></td><td><code>constant</code></td><td>FSDP：constant / cosine（配 <code>min_lr_ratio</code>、<code>num_cycles</code>）</td></tr>
+      <tr><td><code>fsdp.optimizer</code> / <code>optimizer_impl</code></td><td>AdamW / torch.optim</td><td>可换 bitsandbytes <code>AdamW8bit</code>、torchao <code>_AdamW</code>（bf16 随机舍入）等</td></tr>
+      <tr><td><code>megatron.optim.optimizer</code></td><td>adam</td><td>adam / sgd / muon（走 MCore emerging_optimizers，TP 感知 Muon，有十余个 muon_* 子项）</td></tr>
+      <tr><td><code>megatron.optim.lr_decay_style</code></td><td>constant</td><td>constant / linear / cosine / inverse_square_root；另有 WSD 风格 <code>lr_wsd_decay_style</code> + <code>lr_wsd_decay_steps</code></td></tr>
+      <tr><td><code>+megatron.optim.use_precision_aware_optimizer</code></td><td>False</td><td>bf16 优化器状态（main_grads/exp_avg 可设 bf16），显著省优化器显存，需 TE FusedAdam</td></tr>
+      <tr><td><code>+fsdp.optim.override_optimizer_config.optimizer_offload_fraction</code></td><td>—</td><td>部分优化器计算放 CPU；DeepSeek 级模型官方建议设 1，配套 overlap_cpu_optimizer_d2h_h2d / use_precision_aware_optimizer</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="trainer">
+  <h2>6. Trainer 杂项与 checkpoint</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>trainer.total_epochs</code> / <code>total_training_steps</code></td><td>30 / null</td><td>epoch 与步数二选一，steps 优先</td></tr>
+      <tr><td><code>trainer.test_freq</code> / <code>val_before_train</code></td><td>-1 / True</td><td>验证频率（迭代数）/ 训练前基线验证</td></tr>
+      <tr><td><code>trainer.save_freq</code></td><td>-1</td><td>checkpoint 保存间隔；<code>default_local_dir</code> 默认 <code>checkpoints/&lt;project&gt;/&lt;exp&gt;</code></td></tr>
+      <tr><td><code>trainer.max_actor_ckpt_to_keep</code> / <code>max_critic_ckpt_to_keep</code></td><td>null</td><td>滚动保留数量</td></tr>
+      <tr><td><code>trainer.resume_mode</code></td><td>auto</td><td>auto / disable / resume_path（配 <code>resume_from_path</code>）</td></tr>
+      <tr><td><code>actor.checkpoint.save_contents</code></td><td>[model, optimizer, extra]</td><td>可加 <code>hf_model</code> 导出 HF 格式（分片）；<code>load_contents</code> 可只载部分</td></tr>
+      <tr><td><code>actor.checkpoint.async_save</code></td><td>False</td><td>异步保存（目前仅 Megatron）</td></tr>
+      <tr><td><code>trainer.balance_batch</code></td><td>True</td><td>跨 DP worker 按 token 均衡批次（长尾分布下防 straggler）</td></tr>
+      <tr><td><code>trainer.logger</code> / <code>project_name</code> / <code>experiment_name</code></td><td>[console, wandb] / verl_examples / gsm8k</td><td>实验追踪</td></tr>
+      <tr><td><code>trainer.log_val_generations</code></td><td>0</td><td>记录验证生成样本条数（建议 10 起步，便于观察退化）</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="recipes">
+  <h2>7. 算法配方速查：PPO / GRPO / DAPO / REINFORCE++</h2>
+  <p>按官方 best_practices（DAPO = KL 增强版视角）整理的关键差异：</p>
+  <table>
+    <thead>
+      <tr><th>参数</th><th>PPO</th><th>GRPO</th><th>DAPO</th><th>REINFORCE++</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>algorithm.adv_estimator</code></td><td>gae</td><td>grpo</td><td>grpo</td><td>reinforce_plus_plus</td></tr>
+      <tr><td>critic</td><td>需要</td><td>无</td><td>无</td><td>无</td></tr>
+      <tr><td><code>algorithm.use_kl_in_reward</code></td><td>True</td><td>False</td><td>False</td><td>False</td></tr>
+      <tr><td><code>actor.use_kl_loss</code></td><td>False</td><td>True（kl_loss_coef≈0.001）</td><td>False</td><td>视实现</td></tr>
+      <tr><td>ref 模型</td><td>需要</td><td>需要</td><td>不需要</td><td>不需要</td></tr>
+      <tr><td><code>rollout.n</code>（组大小 G）</td><td>1</td><td>典型 64</td><td>典型 16</td><td>组内基线&gt;1 可选</td></tr>
+      <tr><td><code>actor.clip_ratio_low/high</code></td><td>0.2/0.2</td><td>0.2/0.2</td><td>0.2/0.28</td><td>0.2/0.2</td></tr>
+      <tr><td><code>actor.loss_agg_mode</code></td><td>token-mean</td><td>seq-mean-token-mean（原版）/ token-mean（Dr.GRPO）</td><td>token-mean</td><td>token-mean</td></tr>
+      <tr><td><code>reward_model.reward_manager</code></td><td>naive</td><td>naive</td><td>dapo（组过滤）</td><td>naive</td></tr>
+      <tr><td><code>algorithm.filter_groups.enable</code></td><td>False</td><td>False</td><td>True</td><td>False</td></tr>
+    </tbody>
+  </table>
+  <p>
+    现成变体 trainer（dppo / gspo / gmpo / remax / rloo / gpg …）在 <code>examples/&lt;name&gt;_trainer/</code>，
+    多数只需换 <code>adv_estimator</code> + 少量开关，不建议手搓全部超参。
+  </p>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>verl/trainer/config/ppo_trainer.yaml</code>、<code>config/{actor,critic,optim}/*.yaml</code>、
+  <code>docs/perf/best_practices.rst</code> ·
+  相关：<a href="params-rollout.html">Rollout 参数</a> / <a href="performance.html">性能调优</a> ·
+  下一篇：<a href="recipes.html">配置实例 Recipes</a>
+</footer>
+
+</div>
+</body>
+</html>
