@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FAQ 与踩坑记录 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 常见问题：NCCL hang、OOM、grad_norm 暴涨（推理/训练精度不匹配）、CUDA illegal memory access、Triton 编译错误、Ray 注册失败、checkpoint 转换、wandb 代理。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>FAQ 与踩坑记录</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 排错篇</div>
+  <h1>FAQ 与踩坑记录</h1>
+  <div class="meta">
+    依据官方 <code>docs/faq/faq.rst</code>（2025-09）与各配置注释整理；OOM 与显存类问题详见
+    <a href="memory.html">显存与 OOM 规避</a>。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#gradnorm">actor/grad_norm 持续上涨（推理↔训练精度不匹配）★</a></li>
+    <li><a href="#nccl">NCCL hang / 超时</a></li>
+    <li><a href="#oom">OOM 系</a></li>
+    <li><a href="#cuda">CUDA illegal memory access</a></li>
+    <li><a href="#triton">Triton compile_module_from_src 报错</a></li>
+    <li><a href="#ray">Ray：注册失败 / 多机 / SLURM / 调试</a></li>
+    <li><a href="#batch">train / mini / micro batch 是什么关系？</a></li>
+    <li><a href="#ckpt">Checkpoint：转 HF 格式 / 断点续训</a></li>
+    <li><a href="#misc">杂项：wandb 代理、性能 timeline、tensordict arm64、vLLM 版本</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="gradnorm">
+  <h2>1. actor/grad_norm 持续上涨（推理↔训练精度不匹配）★</h2>
+  <p><strong>症状：</strong>训练能跑，但 <code>actor/grad_norm</code> 一路增大，策略不稳定。</p>
+  <p><strong>排查：</strong>打开 rollout 侧 log-prob 对比：</p>
+  <pre><code>actor_rollout_ref.rollout.calculate_log_probs=True</code></pre>
+  <p>观察新增指标 <code>training/rollout_probs_diff_mean</code>：</p>
+  <table>
+    <thead><tr><th>数值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>&lt; 0.005</td><td>正常</td></tr>
+      <tr><td>&gt; 0.01</td><td>推理引擎与训练侧存在精度差异（不是你的超参问题）</td></tr>
+    </tbody>
+  </table>
+  <p><strong>已知触发条件</strong>（三条同时满足时高发）：</p>
+  <ol class="plain">
+    <li>非 Hopper 架构 GPU（A100 / L20 / B200 等）</li>
+    <li>vLLM 存在 <a href="https://github.com/vllm-project/vllm/issues/22103" target="_blank" rel="noopener">issue 22103</a> 的版本</li>
+    <li>输入输出较长（多轮 / Qwen3 类推理模型长思维链）</li>
+  </ol>
+  <p><strong>修复：</strong>根因是 vLLM 所用 flash attention 的 LSE bug（修复未随 vLLM ≤0.10.2 发布），临时关掉 cascade attention：</p>
+  <pre><code>+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_cascade_attn=True</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="nccl">
+  <h2>2. NCCL hang / 超时</h2>
+  <p>训练挂起不报错或最终 NCCL timeout，九成是<strong>并行度约束被违反</strong>导致部分 rank 走了不同分支：</p>
+  <ul class="plain">
+    <li><code>TP × PP × CP × DP(EP)</code> ≠ 总卡数（<code>trainer.nnodes × n_gpus_per_node</code>）</li>
+    <li>transformer 层数不能被 PP 整除且未手动指定切分（<code>num_layers_in_first/last_pipeline_stage</code>）</li>
+    <li>head 数 / hidden 维度不能被 TP（或 Ulysses SP）整除</li>
+    <li>vLLM rollout 的 <code>expert_parallel_size</code> 不满足 EP=TP×DP</li>
+    <li>ref 的 Megatron 并行度与 actor 不一致（权重同步死锁）</li>
+  </ul>
+  <p>排查技巧：临时调大超时便于抓现场 <code>actor_rollout_ref.nccl_timeout=1800</code>，
+    然后看各 rank 卡在哪个 collective 上（py-spy / nsight systems）。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="oom">
+  <h2>3. OOM 系</h2>
+  <p>完整决策路径见<a href="memory.html">显存篇</a>（分阶段画像 + 降级阶梯 + 排查表），此处只列高频误判：</p>
+  <table>
+    <thead><tr><th>误判</th><th>实际原因</th></tr></thead>
+    <tbody>
+      <tr><td>「util 明明只有 0.5 还是 OOM」</td><td>CUDA graph 显存不受 <code>gpu_memory_utilization</code> 约束且无法 offload——<code>enforce_eager=True</code> 或缩小 <code>cudagraph_capture_sizes</code></td></tr>
+      <tr><td>「micro batch 已经是 1 了还 OOM」</td><td>峰值由 token 数决定——改用动态 batch（<code>use_dynamic_bsz=True</code>）压 token 预算，或上序列并行</td></tr>
+      <tr><td>「第一步没事后面才 OOM」</td><td>长尾样本：最长序列决定峰值；或梯度累积期未分片梯度（<code>use_no_sync_for_gradient_accumulation</code>）</td></tr>
+      <tr><td>换 SGLang 后按原 util OOM</td><td>两引擎 util 定义不同（vLLM 按总显存、SGLang 按空闲显存静态部分），数值不能照抄</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="cuda">
+  <h2>4. CUDA illegal memory access</h2>
+  <p>
+    rollout 阶段报 <code>CUDA error: an illegal memory access was encountered</code>：
+    到 <a href="https://docs.vllm.ai" target="_blank" rel="noopener">vLLM 官方文档</a> 按你所用版本排查
+    （常见为特定 attention 后端 + 特定 GPU 架构的组合 bug，升级 vLLM 或切换 <code>enforce_eager</code> / attention backend 验证）。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="triton">
+  <h2>5. Triton compile_module_from_src 报错</h2>
+  <p>
+    堆栈含 <code>triton/runtime/build.py ... compile_module_from_src ... CalledProcessError</code>：
+    Triton JIT 编译 fused kernel 时本机 C 编译环境有问题。
+    按官方建议关闭 fused kernel 的即时编译：
+  </p>
+  <pre><code>actor_rollout_ref.actor.use_torch_compile=False</code></pre>
+  <p>（代价是损失 torch.compile 的提速；更彻底的解法是修好系统的 gcc/clang。）</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="ray">
+  <h2>6. Ray：注册失败 / 多机 / SLURM / 调试</h2>
+
+  <h3>6.1 "Unable to register worker with raylet"</h3>
+  <p>常见于 SLURM：系统限制了 CPU 共享方式，<code>ray.init()</code> 起的 worker 看不到 raylet。修复：</p>
+  <pre><code>ray_kwargs.ray_init.num_cpus=&lt;系统允许的核数&gt;</code></pre>
+
+  <h3>6.2 多机训练</h3>
+  <p>先按 Ray 官方指南起集群（head + worker），再设 <code>trainer.nnodes=&lt;机器数&gt;</code> 提交。
+    SLURM 用户参考官方 <code>examples/tutorial/slurm/ray_on_slurm.slurm</code> 模板改资源配置后 <code>sbatch</code>。</p>
+
+  <h3>6.3 分布式断点调试</h3>
+  <p>用 Ray 官方 distributed debugger（<code>debugpy</code> 断点进任意 worker）：
+    <a href="https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html" target="_blank" rel="noopener">docs.ray.io → ray-distributed-debugger</a></p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="batch">
+  <h2>7. train / mini / micro batch 是什么关系？</h2>
+  <pre><code>train_batch_size × rollout.n        ← 一次 RL 迭代采多少样本（算法语义，全局）
+   └─ ppo_mini_batch_size            ← 一次 optimizer.step() 用多少（全局）
+        └─ micro_batch_size_per_gpu  ← 每卡一次 fwd/bwd 多少（性能参数，本地）
+                                        开 use_dynamic_bsz 后由 *max_token_len_per_gpu 取代</code></pre>
+  <p>官方图解：<a href="https://excalidraw.com/#json=pfhkRmiLm1jnnRli9VFhb,Ut4E8peALlgAUpr7E5pPCA" target="_blank" rel="noopener">excalidraw 链接</a>。
+    详见<a href="performance.html#batch">性能篇 §4</a>。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="ckpt">
+  <h2>8. Checkpoint：转 HF 格式 / 断点续训</h2>
+  <ul class="plain">
+    <li>转 HF safetensors：<code>verl/model_merger</code>（Megatron 分片 → HF 单格式必经步骤）</li>
+    <li>断点续训：<code>trainer.resume_mode=auto</code>（默认，有 checkpoint 自动续）；
+      指定路径用 <code>resume_mode=resume_path resume_from_path=...</code></li>
+    <li>只存模型不存优化器：<code>actor.checkpoint.save_contents=['model']</code>；
+      导出 HF 格式加 <code>'hf_model'</code>（分片存储省空间）</li>
+    <li>滚动清理：<code>trainer.max_actor_ckpt_to_keep=N</code></li>
+    <li>大模型 Megatron 路径建议 <code>actor.checkpoint.async_save=True</code>（异步保存不阻塞训练）</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="misc">
+  <h2>9. 杂项</h2>
+  <table>
+    <thead><tr><th>问题</th><th>解法</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>只给 wandb 走代理（不污染其他请求）</td>
+        <td><code>+trainer.wandb_proxy=http://&lt;proxy:port&gt;</code></td>
+      </tr>
+      <tr>
+        <td>生成 Ray timeline 分析调度</td>
+        <td><code>ray_kwargs.timeline_json_file=/tmp/ray_timeline.json</code>，任务结束后用 chrome://tracing 或 Perfetto 打开</td>
+      </tr>
+      <tr>
+        <td>linux-arm64 上 TensorDict 报 <code>NotImplementedError ... in keyword</code></td>
+        <td>平台无对应 tensordict wheel：源码装 0.6.2，或临时改代码 <code>tensordict_var → tensordict_var.keys()</code></td>
+      </tr>
+      <tr>
+        <td>vLLM 版本要求</td>
+        <td>verl 新版要求 vLLM ≥ 0.18.0，旧版不可用；装错版本是大量玄学问题的来源</td>
+      </tr>
+      <tr>
+        <td>模型下载走 ModelScope</td>
+        <td>环境变量 <code>VERL_USE_MODELSCOPE=True</code></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>docs/faq/faq.rst</code>、<code>docs/start/{install,multinode}.rst</code>、
+  <code>verl/trainer/config/*.yaml</code> 注释 ·
+  相关：<a href="memory.html">显存与 OOM</a> / <a href="performance.html#measure">性能测量</a> ·
+  返回<a href="../index.html">目录</a>
+</footer>
+
+</div>
+</body>
+</html>
