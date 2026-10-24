@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>快速开始 — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 快速上手：安装（uv/docker）、GSM8K 数据准备、Qwen2.5-0.5B PPO 最小训练命令、判断训练是否正常的指标、短试运行技巧。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>快速开始</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 入门篇</div>
+  <h1>快速开始</h1>
+  <div class="meta">
+    依据官方 <code>docs/start/{install,quickstart}.rst</code>（2025-10 main 分支）。
+    目标：从零跑通第一个 PPO 训练，并知道怎么看它是否正常。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#install">安装</a></li>
+    <li><a href="#data">数据准备</a></li>
+    <li><a href="#model">模型准备</a></li>
+    <li><a href="#run">第一次训练（两种方式）</a></li>
+    <li><a href="#verify">判断训练是否正常</a></li>
+    <li><a href="#tips">短试运行技巧</a></li>
+    <li><a href="#next">下一步</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="install">
+  <h2>1. 安装</h2>
+
+  <h3>1.1 uv 工作流（官方推荐）</h3>
+  <p>克隆仓库后无需手动安装，<code>uv run</code> 按仓库锁定的 <code>uv.lock</code> 构建 <code>.venv</code>：</p>
+  <pre><code>git clone https://github.com/volcengine/verl.git && cd verl
+UV_RUN="uv run --frozen --all-packages --extra vllm --extra fsdp"
+$UV_RUN python3 --version   # 首次运行自动建环境</code></pre>
+  <p>extras 选择规则：</p>
+  <ul class="plain">
+    <li>推理引擎<strong>二选一</strong>：<code>--extra vllm</code> 或 <code>--extra sglang</code>（不可同时）；
+      vLLM 需 0.18.0+，旧版已不可用</li>
+    <li>训练后端：<code>--extra fsdp</code>（PyTorch FSDP）/ <code>--extra megatron</code>，可只选其一</li>
+    <li>组合示例：<code>--extra vllm --extra megatron</code>（vLLM 推理 + Megatron 训练）</li>
+  </ul>
+
+  <h3>1.2 Docker</h3>
+  <pre><code>DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.uv.cu130 -t verl:uv-cu130 .
+docker run --rm -it --gpus all verl:uv-cu130 bash
+# 容器内：
+uv run --frozen --all-packages --extra sglang --extra megatron python3 -m verl.trainer.main_ppo ...</code></pre>
+  <p>国产/异构硬件另有独立 Dockerfile：<code>docker/ascend/</code>（昇腾）、<code>docker/rocm/</code>（AMD）等。</p>
+
+  <h3>1.3 硬件门槛</h3>
+  <p>官方 quickstart 要求<strong>单卡 ≥ 24GB HBM</strong>（Qwen2.5-0.5B PPO）。7B 级 FSDP 起步建议单机 8×80G。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="data">
+  <h2>2. 数据准备</h2>
+  <p>verl 统一用 parquet（全量载入内存，建议 &lt;100GB）。GSM8K 一键转换：</p>
+  <pre><code>$UV_RUN python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
+# 产出 ~/data/gsm8k/train.parquet 与 test.parquet</code></pre>
+  <p>parquet 必需字段（自定义数据集按此对齐）：</p>
+  <table>
+    <thead><tr><th>字段</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>prompt</code></td><td>输入（<code>data.prompt_key</code> 可改列名）</td></tr>
+      <tr><td><code>data_source</code></td><td>路由到哪个 reward 函数（<code>data.reward_fn_key</code>）</td></tr>
+      <tr><td><code>reward_model</code></td><td>奖励函数的元数据（如 ground truth 答案）</td></tr>
+    </tbody>
+  </table>
+  <p>GSM8K 用规则奖励：从模型输出里正则抽取 <code>####</code> 后的最终答案，对了 +1，错了 0。其他数据集的转换脚本都在 <code>examples/data_preprocess/</code>。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="model">
+  <h2>3. 模型准备</h2>
+  <p>quickstart 用 <code>Qwen/Qwen2.5-0.5B-Instruct</code>。提前拉取（网络受限可设 <code>VERL_USE_MODELSCOPE=True</code> 改从 ModelScope 下载）：</p>
+  <pre><code>python3 -c "import transformers; transformers.pipeline('text-generation', model='Qwen/Qwen2.5-0.5B-Instruct')"</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="run">
+  <h2>4. 第一次训练（两种方式）</h2>
+
+  <h3>4.1 裸 hydra 命令（理解参数用）</h3>
+  <p>官方 quickstart 的 0.5B PPO 最小命令（单卡 24G+ 可跑）：</p>
+  <pre><code>PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+  data.train_files=$HOME/data/gsm8k/train.parquet \
+  data.val_files=$HOME/data/gsm8k/test.parquet \
+  data.train_batch_size=256 \
+  data.max_prompt_length=512 data.max_response_length=512 \
+  actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+  critic.optim.lr=1e-5 \
+  critic.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+  critic.ppo_micro_batch_size_per_gpu=4 \
+  algorithm.kl_ctrl.kl_coef=0.001</code></pre>
+  <p>uv 工作流下前面加 <code>$UV_RUN</code>，并加 <code>ray_kwargs.ray_init.runtime_env.py_executable="$UV_RUN"</code> 让 Ray worker 也用同一环境（examples/ 脚本已自动处理）。</p>
+
+  <h3>4.2 官方脚本（实际使用推荐）</h3>
+  <p>环境变量覆盖、开箱即调好批次与显存：</p>
+  <pre><code># GRPO + Qwen3-4B，单机 8 卡
+bash examples/grpo_trainer/run_qwen3_4b_fsdp.sh
+
+# 换推理后端 / 换卡数 / 换模型
+INFER_BACKEND=sglang bash examples/ppo_trainer/run_qwen3_8b_fsdp.sh
+NNODES=2 bash examples/grpo_trainer/run_qwen2_5_32b_fsdp.sh</code></pre>
+  <p>
+    各量级脚本的完整参数解读见<a href="recipes.html">Recipes 篇</a>；
+    参数含义查<a href="params-training.html">训练核心参数</a>与<a href="params-rollout.html">Rollout 参数</a>。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="verify">
+  <h2>5. 判断训练是否正常</h2>
+  <p>盯 console / wandb 里的这几组指标（默认 <code>logger=["console","wandb"]</code>）：</p>
+  <table>
+    <thead><tr><th>指标</th><th>正常形态</th><th>异常信号</th></tr></thead>
+    <tbody>
+      <tr><td><code>critic/score/mean</code>（或 val score）</td><td>平稳上升后平台</td><td>长期不动（奖励没信号）或骤降后不恢复（崩了）</td></tr>
+      <tr><td><code>response_length/mean</code></td><td>任务相关（数学类常缓慢变长）</td><td>暴涨到 max_response_length 上限（截断环，看 clip_ratio 确认）</td></tr>
+      <tr><td>rollout <code>clip_ratio</code>（截断比例）</td><td>&lt; 0.1</td><td>&gt; 0.1 说明 response_length 不够，加长或清数据</td></tr>
+      <tr><td>actor <code>clip_ratio/mean</code>（PPO 裁剪）</td><td>低个位数百分比</td><td>接近上限 mini-batch 全被裁（lr 过大或 ppo_epochs 过多）</td></tr>
+      <tr><td><code>kl</code>（KL with ref）</td><td>缓慢增长后稳住</td><td>爆涨（策略漂移过快，加 kl_coef）</td></tr>
+      <tr><td><code>entropy</code></td><td>先降后稳</td><td>快速归零（探索死亡，奖励坍缩到单一答案）</td></tr>
+      <tr><td>timing 分解</td><td>gen / update 各占合理比例</td><td>某阶段占 90%+ → 去<a href="performance.html#measure">性能篇 §1</a>定位</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="tips">
+  <h2>6. 短试运行技巧</h2>
+  <p>正式跑之前永远先做一次廉价验证：</p>
+  <pre><code># 只跑 10 步：验证配置能启动、显存峰值、每步耗时
+trainer.total_training_steps=10
+
+# 只验证不训练（模型/数据/reward 链路通了没）
+trainer.val_only=True  trainer.val_before_train=True
+
+# 排查 rollout：打开引擎统计看 KV 利用率
+actor_rollout_ref.rollout.disable_log_stats=False</code></pre>
+  <p>OOM 了去<a href="memory.html#ladder">显存篇的降级阶梯</a>，按代价从小到大逐项试，不要一次全开。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="next">
+  <h2>7. 下一步</h2>
+  <ul class="plain">
+    <li>换自己的任务 → 自定义 reward 函数：<code>verl/utils/reward_score/</code>（官方 <code>docs/preparation/reward_function.rst</code>）</li>
+    <li>换 GRPO（去 critic）→ <a href="params-training.html#recipes">训练篇 §7 配方速查</a></li>
+    <li>放大模型 → <a href="parallelism.html">并行策略</a> + <a href="recipes.html">Recipes</a></li>
+    <li>压榨吞吐 → <a href="performance.html">性能调优</a></li>
+    <li>踩坑了 → <a href="faq.html">FAQ 与踩坑记录</a></li>
+    <li>多机启动（Ray 集群 / SLURM / run.sh）→ 官方 <code>docs/start/multinode.rst</code></li>
+  </ul>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>docs/start/install.rst</code>、<code>docs/start/quickstart.rst</code>、
+  <code>examples/data_preprocess/gsm8k.py</code> ·
+  下一篇：<a href="parallelism.html">并行策略详解</a>
+</footer>
+
+</div>
+</body>
+</html>
