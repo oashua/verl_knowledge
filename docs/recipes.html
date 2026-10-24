@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>配置实例 Recipes — verl 强化后训练知识库</title>
+  <meta name="description" content="verl 配置实例：0.5B 到 671B 各量级官方示例脚本的实际并行/显存/批次参数，标注可调项与迁移方法。">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="crumbs">
+    <a href="../index.html">verl 知识库</a><span>/</span><span>配置实例 Recipes</span>
+  </div>
+  <a class="back" href="../index.html">← 返回目录</a>
+</div>
+
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="kicker">参数手册 · 实战篇</div>
+  <h1>配置实例 Recipes</h1>
+  <div class="meta">
+    全部数值取自 verl 官方示例脚本 <code>examples/{ppo,grpo}_trainer/</code>（2025-10 main 分支），
+    非凭空推荐。每条注明来源脚本，可直接对照原文件。
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">本页目录</div>
+  <ol>
+    <li><a href="#overview">官方脚本一览</a></li>
+    <li><a href="#r4b">4B 级：单机 8 卡 GRPO（FSDP）</a></li>
+    <li><a href="#r8b">8B 级：单机 8 卡 PPO（FSDP / Megatron）</a></li>
+    <li><a href="#r30b">30B-A3B MoE：单机 8 卡 GRPO（FSDP + 全 offload）</a></li>
+    <li><a href="#r32b">32B 稠密：双机 16 卡 GRPO（FSDP）</a></li>
+    <li><a href="#r235b">235B-A22B MoE：8 机 64 卡 GRPO（Megatron）</a></li>
+    <li><a href="#r671b">671B MoE：12 机 96 卡 GRPO（Megatron）</a></li>
+    <li><a href="#adapt">迁移到自己的模型/集群</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="block" id="overview">
+  <h2>1. 官方脚本一览</h2>
+  <p>所有脚本支持环境变量覆盖（如 <code>NNODES=2 bash run_qwen3_4b_fsdp.sh</code>）：</p>
+  <table>
+    <thead><tr><th>模型量级</th><th>脚本</th><th>后端</th><th>默认规模</th></tr></thead>
+    <tbody>
+      <tr><td>4B</td><td><code>grpo_trainer/run_qwen3_4b_fsdp.sh</code></td><td>FSDP</td><td>1 机 8 卡</td></tr>
+      <tr><td>8B</td><td><code>ppo_trainer/run_qwen3_8b_fsdp.sh</code></td><td>FSDP</td><td>1 机 8 卡</td></tr>
+      <tr><td>8B</td><td><code>ppo_trainer/run_qwen3_8b_megatron.sh</code></td><td>Megatron</td><td>1 机 8 卡</td></tr>
+      <tr><td>30B-A3B MoE</td><td><code>grpo_trainer/run_qwen3_30b_a3b_fsdp.sh</code></td><td>FSDP</td><td>1 机 8 卡</td></tr>
+      <tr><td>32B 稠密</td><td><code>grpo_trainer/run_qwen2_5_32b_fsdp.sh</code></td><td>FSDP</td><td>2 机 16 卡</td></tr>
+      <tr><td>235B-A22B MoE</td><td><code>grpo_trainer/run_qwen3_235b_a22b_megatron.sh</code></td><td>Megatron</td><td>8 机 64 卡</td></tr>
+      <tr><td>671B MoE</td><td><code>grpo_trainer/run_deepseek_v3_671b_megatron.sh</code></td><td>Megatron</td><td>12 机 96 卡</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>找脚本优先级：</b>先在 <code>examples/</code> 找同名/同架构模型脚本直接改，比从零调参可靠得多。</div>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="r4b">
+  <h2>2. 4B 级：单机 8 卡 GRPO（FSDP）</h2>
+  <p>来源：<code>run_qwen3_4b_fsdp.sh</code>。小模型的标准形态——不加 TP，纯 FSDP 全分片。</p>
+  <pre><code>trainer.nnodes=1  trainer.n_gpus_per_node=8
+data.train_batch_size=512          data.max_response_length=1024
+actor_rollout_ref.actor.fsdp_config.param_offload=False      # 显存够，不开
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+actor_rollout_ref.ref.fsdp_config.param_offload=True          # ref 无梯度，白占显存，offload
+actor_rollout_ref.rollout.tensor_model_parallel_size=2</code></pre>
+  <p>要点：小模型瓶颈在推理侧并发，rollout TP=2 出 4 个 replica；训练侧无任何 offload 换速度。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="r8b">
+  <h2>3. 8B 级：单机 8 卡 PPO（FSDP / Megatron）</h2>
+
+  <h3>3.1 FSDP 版（<code>ppo_trainer/run_qwen3_8b_fsdp.sh</code>）——最常被参考的基线</h3>
+  <pre><code>data.train_batch_size=1024        actor_rollout_ref.actor.ppo_mini_batch_size=256
+data.max_prompt_length=1024       data.max_response_length=2048
+actor_rollout_ref.model.use_remove_padding=True
+actor_rollout_ref.model.enable_gradient_checkpointing=True
+actor_rollout_ref.actor.use_dynamic_bsz=True
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576
+actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576
+actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576
+actor_rollout_ref.actor.optim.lr=1e-6          critic.optim.lr=1e-5
+actor_rollout_ref.rollout.tensor_model_parallel_size=2
+actor_rollout_ref.rollout.gpu_memory_utilization=0.6
+critic.model.use_remove_padding=True  critic.model.enable_gradient_checkpointing=True</code></pre>
+  <p>
+    要点：① 全角色开动态 batch，token 预算 24576 ≈ 8×(1024+2048)；② actor/critic 不 offload、ref offload；
+    ③ rollout util 0.6——训练侧留 40% 给权重+优化器。
+  </p>
+
+  <h3>3.2 Megatron 版（<code>ppo_trainer/run_qwen3_8b_megatron.sh</code>）</h3>
+  <pre><code>actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2   # ACTOR_TP
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2   # ACTOR_PP
+actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2       # 与 actor 对齐
+actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=2
+critic.megatron.tensor_model_parallel_size=2                      # critic 独立配置
+actor_rollout_ref.rollout.tensor_model_parallel_size=2</code></pre>
+  <p>要点：8 卡 = TP2×PP2×DP2；同一份 8 卡上 FSDP 版更简单，Megatron 版适合后续平滑扩到更大模型。</p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="r30b">
+  <h2>4. 30B-A3B MoE：单机 8 卡 GRPO（FSDP + 全 offload）</h2>
+  <p>来源：<code>run_qwen3_30b_a3b_fsdp.sh</code>。单机塞 MoE 的典型做法——offload 全开：</p>
+  <pre><code>data.max_response_length=4096        # 长思维链
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768
+actor_rollout_ref.actor.fsdp_config.param_offload=True
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+actor_rollout_ref.ref.fsdp_config.param_offload=True</code></pre>
+  <p>
+    要点：① 30B 总参数虽大但激活仅 3B，FSDP 分片 + 全 offload 后单机可训；
+    ② token 预算 32768 &gt; 8B 版（prompt 短、response 长）；
+    ③ offload 换来的空闲显存可让 <code>rollout.gpu_memory_utilization</code> 上调。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="r32b">
+  <h2>5. 32B 稠密：双机 16 卡 GRPO（FSDP）</h2>
+  <p>来源：<code>run_qwen2_5_32b_fsdp.sh</code>。稠密中模型跨机仍可用 FSDP：</p>
+  <pre><code>trainer.nnodes=2
+data.train_batch_size=1024       data.max_response_length=1024
+actor_rollout_ref.rollout.tensor_model_parallel_size=8     # ROLLOUT_TP
+actor_rollout_ref.actor.fsdp_config.param_offload=False
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=False</code></pre>
+  <p>
+    要点：① 32B×16bytes ≈ 512GB 静态，16 卡全分片每卡 32GB，仍有余量所以不开 offload；
+    ② rollout TP=8（单 KV 判据：80G×util×8 ≫ 2×32B）；③ 跨机 all-gather 是瓶颈时可改
+    <code>fsdp_size=8</code>（Hybrid Shard，见<a href="parallelism.html#fsdp">并行篇 §3</a>）。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="r235b">
+  <h2>6. 235B-A22B MoE：8 机 64 卡 GRPO（Megatron）</h2>
+  <p>来源：<code>run_qwen3_235b_a22b_megatron.sh</code>（对应官方 DAPO 最佳实践文档）：</p>
+  <pre><code>trainer.nnodes=8                                    # 64 GPU
+data.train_batch_size=128        ppo_mini_batch_size=128   # DAPO 不重用数据
+ACTOR_TP=4   ACTOR_PP=8   ACTOR_EP=4                      # 64 = 4×8×(EP4×DP2)
+ALL_OFFLOAD=True                                            # param+optimizer 全 offload
++...megatron.override_transformer_config.recompute_method=uniform
++...megatron.override_transformer_config.recompute_granularity=full
++...megatron.override_transformer_config.recompute_num_layers=1
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1      # 固定 micro batch（超大模型）
+actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4   # 前向 4×
+actor_rollout_ref.rollout.tensor_model_parallel_size=8      # ROLLOUT_TP
+actor_rollout_ref.rollout.expert_parallel_size=64           # ROLLOUT_EP
+actor_rollout_ref.rollout.gpu_memory_utilization=0.75</code></pre>
+  <p>
+    要点：① MoE 显存大头是专家权重 → EP=4（训练）+ rollout EP=64（每卡一个专家分片）；
+    ② full recompute + num_layers=1 = 逐层重计算，最省激活；③ micro batch=1 说明 235B 下激活才是瓶颈，
+    靠吞吐靠大 batch 攒；④ util 0.75 依赖训练侧全 offload。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="r671b">
+  <h2>7. 671B MoE：12 机 96 卡 GRPO（Megatron）</h2>
+  <p>来源：<code>run_deepseek_v3_671b_megatron.sh</code>：</p>
+  <pre><code>trainer.nnodes=12                                   # 96 GPU
+ACTOR_TP=8   ACTOR_PP=12   ACTOR_EP=8   ACTOR_CP=1   # 96 = 8×12×(EP8 内含 DP)
+OFFLOAD=True  OPTIM_OFFLOAD=True
++...optim.override_optimizer_config.optimizer_cpu_offload=True   # 混合 CPU 优化器
++...megatron.override_transformer_config.recompute_method=uniform
++...megatron.override_transformer_config.recompute_granularity=full
+actor_rollout_ref.rollout.tensor_model_parallel_size=32          # ROLLOUT_TP
+actor_rollout_ref.rollout.gpu_memory_utilization=0.6</code></pre>
+  <p>
+    要点：① 671B 静态 ≈ 10.7TB，即使 96 卡全 offload 后仍紧张——util 只有 0.6；
+    ② rollout TP=32：671B 权重需 TP≥34 才装得下（80G×0.6×32=1.5TB ≈ 2×671B bf16），所以选 32；
+    ③ <code>optimizer_cpu_offload</code>+分层 offload 是这个量级的必要手段。
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<section class="block" id="adapt">
+  <h2>8. 迁移到自己的模型/集群</h2>
+  <ol class="plain">
+    <li><strong>找最近邻脚本</strong>：同架构（dense/MoE）+ 参数量最接近的官方脚本作为起点</li>
+    <li><strong>先算静态显存</strong>：16×参数量 bytes，对照<a href="memory.html#formula">显存篇 §2</a> 公式
+      决定分片度与 offload 级别；MoE 优先 EP，dense 优先 TP/分片</li>
+    <li><strong>rollout TP 用 KV 判据</strong>：<code>单卡显存×util×TP &gt; 2×参数量</code> 取最小满足值</li>
+    <li><strong>token 预算按长度重算</strong>：<code>ppo_max_token_len_per_gpu ≈ 数×(prompt+response)</code>，从官方同长度脚本抄比例</li>
+    <li><strong>验证整除约束</strong>：<code>TP×PP×CP×EP(DP)</code> = 总卡数；transformer 层数 ÷ PP 整除</li>
+    <li><strong>跑 10 步试运行</strong>：<code>trainer.total_training_steps=10</code> + <code>disable_log_stats=False</code>，
+      看峰值显存与各阶段耗时，再按<a href="performance.html#checklist">性能篇 checklist</a>逐项收紧</li>
+    <li><strong>不覆盖、可复现</strong>：改环境变量而非改脚本；记录 <code>pip freeze</code> 与完整 hydra 命令行</li>
+  </ol>
+</section>
+
+<footer class="doc-footer">
+  来源：verl <code>examples/ppo_trainer/run_qwen3_8b_{fsdp,megatron}.sh</code>、
+  <code>examples/grpo_trainer/run_qwen3_{4b,30b_a3b,235b_a22b}_*.sh</code>、
+  <code>run_qwen2_5_32b_fsdp.sh</code>、<code>run_deepseek_v3_671b_megatron.sh</code> ·
+  相关：<a href="parallelism.html">并行</a> / <a href="memory.html">显存</a> / <a href="performance.html">性能</a> ·
+  下一篇：<a href="faq.html">FAQ 与踩坑记录</a>
+</footer>
+
+</div>
+</body>
+</html>
