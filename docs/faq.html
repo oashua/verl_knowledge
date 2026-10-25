@@ -143,7 +143,10 @@
         └─ micro_batch_size_per_gpu  ← 每卡一次 fwd/bwd 多少（性能参数，本地）
                                         开 use_dynamic_bsz 后由 *max_token_len_per_gpu 取代</code></pre>
   <p>官方图解：<a href="https://excalidraw.com/#json=pfhkRmiLm1jnnRli9VFhb,Ut4E8peALlgAUpr7E5pPCA" target="_blank" rel="noopener">excalidraw 链接</a>。
-    详见<a href="performance.html#batch">性能篇 §4</a>。</p>
+    完整换算公式（含 DP 推导与官方基线代入示例）见<a href="performance.html#batch">性能篇 §4.1</a>：</p>
+  <pre><code>mini_batch_per_gpu = ppo_mini_batch_size ÷ DP        （必须整除）
+梯度累积次数       = mini_batch_per_gpu ÷ ppo_micro_batch_size_per_gpu
+DP: FSDP = world÷ulysses_sp;  Megatron = world÷(TP×PP×CP)</code></pre>
 </section>
 
 <!-- ============================================================ -->

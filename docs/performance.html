@@ -139,7 +139,32 @@ critic.model.use_remove_padding=True              # critic（如有）</code></p
   </table>
   <div class="note"><b>注意：</b>脚本里请用 <code>*_per_gpu</code> 版本；旧的 <code>ppo_micro_batch_size</code>（全局）已标记废弃。</div>
 
-  <h3>4.1 固定 micro batch 的调法</h3>
+  <h3>4.1 全链路换算公式（源码核实）</h3>
+  <p>
+    归一化发生在 worker 内部（<code>verl/workers/engine_workers.py: train_mini_batch</code>），
+    四个量的换算关系（固定 batch 路径）：
+  </p>
+  <pre><code>DP（数据并行度）:
+  FSDP 后端   = world_size ÷ ulysses_sequence_parallel_size
+               （fsdp_size 只影响分片组，不影响数据切分）
+  Megatron    = world_size ÷ (TP × PP × CP)      （EP 再从 DP 细分专家）
+
+每 DP rank 样本数 = train_batch_size × rollout.n ÷ DP
+mini_batch_per_gpu = ppo_mini_batch_size ÷ DP       ← 必须整除，否则断言失败
+梯度累积次数       = mini_batch_per_gpu ÷ ppo_micro_batch_size_per_gpu
+每轮 optimizer 步数 = (每 DP rank 样本数 ÷ mini_batch_per_gpu) × ppo_epochs</code></pre>
+  <p><strong>代入官方 8B 基线</strong>（单机 8 卡 FSDP，全分片，ulysses=1 → DP=8）：</p>
+  <pre><code>train_batch_size=1024, rollout.n=1  → 每 rank 128 个样本
+ppo_mini_batch_size=256             → 每 rank 32（整除 ✓）
+若 ppo_micro_batch_size_per_gpu=4   → 每次优化 step 累积 8 个 micro-batch
+一轮数据 128÷32=4 次优化 step × ppo_epochs(=1)</code></pre>
+  <div class="tip">
+    <b>两个易错点：</b>① <code>ppo_mini_batch_size</code> 不整除 DP 时启动即断言报错（报错信息就是上面源码的 assert）；
+    ② <code>trainer.balance_batch=True</code>（默认开）按 token 数在 DP rank 间均衡，样本数会轻微偏离公式值，
+    但 mini/micro 的切分仍按上述公式执行。动态 batch 开启后，micro 一层被 token 预算取代，mini 一层公式不变。
+  </div>
+
+  <h3>4.2 固定 micro batch 的调法</h3>
   <ol class="plain">
     <li>先开 gradient checkpointing，micro batch 才有上调空间</li>
     <li><code>ppo_micro_batch_size_per_gpu</code> 尽量加大，直至 ≤ 归一化后的 mini_batch_size（再大就浪费）</li>
@@ -147,7 +172,7 @@ critic.model.use_remove_padding=True              # critic（如有）</code></p
     <li>critic / reward 的 micro batch 可大于 actor（actor 输出头 vocab 巨大是瓶颈）</li>
   </ol>
 
-  <h3>4.2 动态 batch（推荐）</h3>
+  <h3>4.3 动态 batch（推荐）</h3>
   <p>
     <code>use_dynamic_bsz=True</code> 后不再调 <code>*micro_batch_size_per_gpu</code>，
     改调 token 预算 <code>*max_token_len_per_gpu</code>（详见显存篇 §4.2）。
