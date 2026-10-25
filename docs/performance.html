@@ -165,12 +165,22 @@ ppo_mini_batch_size=256             → 每 rank 32（整除 ✓）
   </div>
 
   <h3>4.2 固定 micro batch 的调法</h3>
-  <ol class="plain">
-    <li>先开 gradient checkpointing，micro batch 才有上调空间</li>
-    <li><code>ppo_micro_batch_size_per_gpu</code> 尽量加大，直至 ≤ 归一化后的 mini_batch_size（再大就浪费）</li>
+  <p>
+    micro 只是 mini 的<strong>切分粒度</strong>：一次 optimizer step 处理 <code>mini_batch_per_gpu</code> 个样本，
+    显存装不下就切成若干 micro-batch 做梯度累积。每个 micro-batch 的 fwd/bwd 有固定开销
+    （kernel 启动、通信往返、算力不满载），切分次数越少越快：
+  </p>
+  <pre><code>mini_batch_per_gpu = 32
+micro_per_gpu = 4   →  8 次 fwd/bwd + 梯度累积，凑一次 step
+micro_per_gpu = 32  →  1 次 fwd/bwd 直接算完，累积次数 = 1（物理上限）</code></pre>
+  <ul class="plain">
+    <li>上限是 mini_batch_per_gpu：dataloader 每 step 只给这么多样本，micro 再大也无样本可填，
+      且源码要求整除（<code>total_data_size % micro_batch_size_per_gpu == 0</code> 断言）</li>
+    <li>下限受显存约束。完整决策式：<code>ppo_micro_batch_size_per_gpu = min(显存能装下的最大值, mini_batch_per_gpu)</code></li>
+    <li>前提：先开 gradient checkpointing——激活显存降一个量级后，「显存能装下的最大值」往往能直接顶到 mini 本身</li>
     <li>纯前向角色（ref/rollout 的 log-prob、critic/RM forward）可设为 actor 的 2 倍</li>
     <li>critic / reward 的 micro batch 可大于 actor（actor 输出头 vocab 巨大是瓶颈）</li>
-  </ol>
+  </ul>
 
   <h3>4.3 动态 batch（推荐）</h3>
   <p>
